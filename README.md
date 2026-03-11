@@ -85,9 +85,9 @@ npm run dev-server
 
 ## Changelog
 
-### **WORK IN PROGRESS**
+### 0.0.2
 - Improved telemetry refresh strategy (adaptive polling + post-command sync)
-- Automatic apply for task settings on slider changes
+- Automatic apply for task, route and non-work settings
 - Extended command handling and retry flow
 
 ## License

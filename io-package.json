@@ -15,19 +15,6 @@
                 "pl": "Ulepszona synchronizacja telemetrii i automatyczne stosowanie dla task/route/non-work",
                 "uk": "Покращено синхронізацію телеметрії та додано авто-застосування для task/route/non-work",
                 "zh-cn": "改进了遥测同步，并为 task/route/non-work 增加了自动应用"
-            },
-            "0.0.1": {
-                "en": "initial release",
-                "de": "Erstveröffentlichung",
-                "ru": "Начальная версия",
-                "pt": "lançamento inicial",
-                "nl": "Eerste uitgave",
-                "fr": "Première version",
-                "it": "Versione iniziale",
-                "es": "Versión inicial",
-                "pl": "Pierwsze wydanie",
-                "uk": "Початкова версія",
-                "zh-cn": "首次出版"
             }
         },
         "titleLang": {
@@ -84,10 +71,12 @@
         ],
         "globalDependencies": [
             {
-                "admin": ">=7.0.23"
+                "admin": ">=7.6.20"
             }
         ]
     },
+    "protectedNative": ["password"],
+    "encryptedNative": ["password"],
     "native": {
         "email": "",
         "password": "",
