@@ -1333,15 +1333,34 @@ class Mammotion extends utils.Adapter {
 
     private async refreshSessionAndDeviceCache(): Promise<void> {
         const session = await this.ensureValidSession(true);
-        const devices = await this.fetchDeviceList(session);
-        const modernRecords = await this.fetchDeviceRecords(session);
-        let records = [...modernRecords];
+
+        // Modern APIs may not return shared devices (owned: 0) – make resilient
+        let devices: MammotionDevice[] = [];
+        try {
+            devices = await this.fetchDeviceList(session);
+        } catch (err) {
+            this.log.debug(`Modern device list nicht verfügbar: ${this.extractAxiosError(err)}`);
+        }
+
+        let modernRecords: DeviceRecord[] = [];
+        try {
+            modernRecords = await this.fetchDeviceRecords(session);
+        } catch (err) {
+            this.log.debug(`Modern device records nicht verfügbar: ${this.extractAxiosError(err)}`);
+        }
+
+        // Legacy bindings always fetched – shared devices (owned: 0) only appear here
+        const legacyRecords = await this.fetchLegacyDeviceRecords(session);
+
+        // Merge: modern records first, add legacy entries not already covered
+        const modernIotIds = new Set(modernRecords.map(r => r.iotId).filter(Boolean));
+        const records = [
+            ...modernRecords,
+            ...legacyRecords.filter(r => r.iotId && !modernIotIds.has(r.iotId)),
+        ];
 
         if (!records.length) {
-            const legacyRecords = await this.fetchLegacyDeviceRecords(session);
-            if (legacyRecords.length) {
-                records = legacyRecords;
-            }
+            this.log.warn('Keine Geräte gefunden (weder modern noch legacy). Shared-Gerät vorhanden?');
         }
 
         await this.syncDevices(devices, records);
@@ -1480,7 +1499,7 @@ class Mammotion extends utils.Adapter {
                     owned: this.pickNumber(binding.owned) ?? undefined,
                 }));
         } catch (err) {
-            this.log.debug(`Legacy-Bindings konnten nicht geladen werden: ${this.extractAxiosError(err)}`);
+            this.log.warn(`Legacy-Bindings konnten nicht geladen werden: ${this.extractAxiosError(err)}`);
             return [];
         }
     }

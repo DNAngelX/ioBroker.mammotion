@@ -1183,14 +1183,26 @@ class Mammotion extends utils.Adapter {
   }
   async refreshSessionAndDeviceCache() {
     const session = await this.ensureValidSession(true);
-    const devices = await this.fetchDeviceList(session);
-    const modernRecords = await this.fetchDeviceRecords(session);
-    let records = [...modernRecords];
+    let devices = [];
+    try {
+      devices = await this.fetchDeviceList(session);
+    } catch (err) {
+      this.log.debug(`Modern device list nicht verf\xFCgbar: ${this.extractAxiosError(err)}`);
+    }
+    let modernRecords = [];
+    try {
+      modernRecords = await this.fetchDeviceRecords(session);
+    } catch (err) {
+      this.log.debug(`Modern device records nicht verf\xFCgbar: ${this.extractAxiosError(err)}`);
+    }
+    const legacyRecords = await this.fetchLegacyDeviceRecords(session);
+    const modernIotIds = new Set(modernRecords.map((r) => r.iotId).filter(Boolean));
+    const records = [
+      ...modernRecords,
+      ...legacyRecords.filter((r) => r.iotId && !modernIotIds.has(r.iotId))
+    ];
     if (!records.length) {
-      const legacyRecords = await this.fetchLegacyDeviceRecords(session);
-      if (legacyRecords.length) {
-        records = legacyRecords;
-      }
+      this.log.warn("Keine Ger\xE4te gefunden (weder modern noch legacy). Shared-Ger\xE4t vorhanden?");
     }
     await this.syncDevices(devices, records);
     await this.setStateChangedAsync("info.deviceCount", this.deviceContexts.size, true);
@@ -1288,7 +1300,7 @@ class Mammotion extends utils.Adapter {
         };
       });
     } catch (err) {
-      this.log.debug(`Legacy-Bindings konnten nicht geladen werden: ${this.extractAxiosError(err)}`);
+      this.log.warn(`Legacy-Bindings konnten nicht geladen werden: ${this.extractAxiosError(err)}`);
       return [];
     }
   }
