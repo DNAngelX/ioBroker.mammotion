@@ -1,7 +1,5 @@
-# No dot-directories except github/vscode
+# No dot-directories
 .*/
-!.vscode/
-!.github/
 
 *.code-workspace
 node_modules
@@ -16,3 +14,7 @@ Thumbs.db
 # i18n intermediate files
 admin/i18n/flat.txt
 admin/i18n/*/flat.txt
+
+# Local development artifacts
+docs/
+test/*.xapk

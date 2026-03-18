@@ -2,5 +2,6 @@
     "mammotion adapter settings": "Adaptereinstellungen für mammotion",
     "email": "E-Mail",
     "password": "Passwort",
-    "deviceUuid": "Geräte-UUID"
+    "deviceUuid": "Geräte-UUID",
+    "storeDebugPayloads": "Debug-Payloads speichern"
 }

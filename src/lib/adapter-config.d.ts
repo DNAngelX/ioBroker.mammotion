@@ -9,6 +9,7 @@ declare global {
             deviceUuid: string;
             legacyPollIntervalSec: number;
             legacyTelemetryTransport: 'poll' | 'mqtt';
+            storeDebugPayloads: boolean;
         }
     }
 }

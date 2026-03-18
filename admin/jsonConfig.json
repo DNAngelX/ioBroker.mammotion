@@ -68,6 +68,17 @@
             "md": 6,
             "lg": 4,
             "xl": 4
+        },
+        "storeDebugPayloads": {
+            "type": "checkbox",
+            "label": "storeDebugPayloads",
+            "hint": "Speichert lastPayload und lastProtoContent. Nur fuer Analyse aktivieren.",
+            "newLine": true,
+            "xs": 12,
+            "sm": 12,
+            "md": 6,
+            "lg": 4,
+            "xl": 4
         }
     }
 }
