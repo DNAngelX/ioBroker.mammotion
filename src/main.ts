@@ -5,6 +5,13 @@
 import * as utils from '@iobroker/adapter-core';
 import axios, { AxiosError } from 'axios';
 import { createHash, createHmac, randomInt } from 'node:crypto';
+import {
+    LUBA_PRO_PRODUCT_KEYS,
+    YUKA_MINI_PRODUCT_KEYS,
+    YUKA_ML_PRODUCT_KEYS,
+    YUKA_PRODUCT_KEYS,
+    resolveProductKeyGroup,
+} from './lib/product-keys';
 const mqtt = require('mqtt') as { connect: (url: string, options: Record<string, any>) => any };
 
 const MAMMOTION_DOMAIN = 'https://id.mammotion.com';
@@ -110,7 +117,6 @@ const ROUTE_BORDER_MODE_NAMES: Record<number, string> = {
     0: 'NONE',
     1: 'BORDER_FIRST',
 };
-const LUBA_PRO_PRODUCT_KEYS = new Set<string>(['a1mb8v6tnAa', 'a1pHsTqyoPR']);
 const CUT_HEIGHT_MIN_MM = 30;
 const CUT_HEIGHT_MAX_MM = 70;
 const CUT_HEIGHT_STEP_MM = 5;
@@ -1231,6 +1237,11 @@ class Mammotion extends utils.Adapter {
             await this.setStateChangedAsync(`${channelId}.productSeries`, device?.productSeries || '', true);
             await this.setStateChangedAsync(`${channelId}.status`, context.status ?? -1, true);
             await this.setStateChangedAsync(`${channelId}.productKey`, context.productKey, true);
+            await this.setStateChangedAsync(
+                `${channelId}.productKeyGroup`,
+                resolveProductKeyGroup(context.productKey) || 'UNKNOWN',
+                true,
+            );
             await this.setStateChangedAsync(`${channelId}.recordDeviceName`, context.recordDeviceName, true);
             await this.setStateChangedAsync(`${channelId}.raw`, JSON.stringify({ device, record }), true);
             await this.setStateChangedAsync(`${channelId}.telemetry.connected`, (context.status ?? 0) === 1, true);
@@ -1369,6 +1380,11 @@ class Mammotion extends utils.Adapter {
             ctx.recordDeviceName = recordDeviceName;
             this.mqttTopicMap.set(`${productKey}/${recordDeviceName}`, deviceKey);
             await this.setStateChangedAsync(`devices.${deviceKey}.productKey`, productKey, true);
+            await this.setStateChangedAsync(
+                `devices.${deviceKey}.productKeyGroup`,
+                resolveProductKeyGroup(productKey) || 'UNKNOWN',
+                true,
+            );
             await this.setStateChangedAsync(`devices.${deviceKey}.recordDeviceName`, recordDeviceName, true);
         }
         if (ctx && payloadIotId && payloadIotId !== ctx.iotId) {
@@ -2980,6 +2996,9 @@ class Mammotion extends utils.Adapter {
         if (!context) {
             return false;
         }
+        if (YUKA_PRODUCT_KEYS.has(context.productKey) || YUKA_MINI_PRODUCT_KEYS.has(context.productKey) || YUKA_ML_PRODUCT_KEYS.has(context.productKey)) {
+            return true;
+        }
         const type = this.getDeviceTypeCode(context);
         if (type !== null && [3, 4, 5, 8, 14, 16, 21].includes(type)) {
             return true;
@@ -2992,6 +3011,9 @@ class Mammotion extends utils.Adapter {
         if (!context) {
             return false;
         }
+        if (YUKA_MINI_PRODUCT_KEYS.has(context.productKey)) {
+            return true;
+        }
         const type = this.getDeviceTypeCode(context);
         if (type !== null && [4, 5].includes(type)) {
             return true;
@@ -3003,6 +3025,9 @@ class Mammotion extends utils.Adapter {
     private isYukaMlDevice(context?: DeviceContext): boolean {
         if (!context) {
             return false;
+        }
+        if (YUKA_ML_PRODUCT_KEYS.has(context.productKey)) {
+            return true;
         }
         const type = this.getDeviceTypeCode(context);
         if (type === 16) {
@@ -4320,6 +4345,7 @@ class Mammotion extends utils.Adapter {
         await this.setObjectNotExistsAsync(`${channelId}.series`, this.createReadonlyState('Series', 'string', 'text'));
         await this.setObjectNotExistsAsync(`${channelId}.productSeries`, this.createReadonlyState('Product series', 'string', 'text'));
         await this.setObjectNotExistsAsync(`${channelId}.productKey`, this.createReadonlyState('Product key', 'string', 'text'));
+        await this.setObjectNotExistsAsync(`${channelId}.productKeyGroup`, this.createReadonlyState('Product key group', 'string', 'text'));
         await this.setObjectNotExistsAsync(`${channelId}.recordDeviceName`, this.createReadonlyState('Record device name', 'string', 'text'));
         await this.setObjectNotExistsAsync(`${channelId}.status`, this.createReadonlyState('Status', 'number', 'value'));
         await this.setObjectNotExistsAsync(`${channelId}.raw`, this.createReadonlyState('Raw device payload', 'string', 'json'));
@@ -4974,6 +5000,11 @@ class Mammotion extends utils.Adapter {
                 if (productKey && !ctx.productKey) {
                     ctx.productKey = productKey;
                     await this.setStateChangedAsync(`devices.${deviceKey}.productKey`, productKey, true);
+                    await this.setStateChangedAsync(
+                        `devices.${deviceKey}.productKeyGroup`,
+                        resolveProductKeyGroup(productKey) || 'UNKNOWN',
+                        true,
+                    );
                 }
                 if (recordDeviceName && !ctx.recordDeviceName) {
                     ctx.recordDeviceName = recordDeviceName;

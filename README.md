@@ -90,7 +90,7 @@ If you only have one account or do not use the mobile app regularly, you can ent
 
 ### Per device
 
-- `devices.<id>.name`, `iotId`, `deviceId`, `deviceType`, `deviceTypeText`, ...
+- `devices.<id>.name`, `iotId`, `deviceId`, `deviceType`, `deviceTypeText`, `productKey`, `productKeyGroup`, ...
 - `devices.<id>.telemetry.*` (battery, state, gps, firmware version, WiFi RSSI, work time, mileage, task area, last payload/topic/update, areasJson, ...)
 - `devices.<id>.commands.*` (actions + writable parameters)
 - `devices.<id>.zones.<name>.enabled` – toggle individual zones on/off for batch mowing
@@ -214,23 +214,23 @@ setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({
 - `telemetry.lastUpdate` only means a telemetry packet was processed. If values do not change, the cloud may be returning unchanged data.
 - Mammotion cloud sessions can invalidate each other (mobile app vs adapter). Using a shared device account (Option B above) avoids this entirely.
 - Command limits follow model defaults (example: Luba 20–35 cm route width, Yuka 15–30 cm, Yuka Mini 8–12 cm).
+- Device family detection uses productKey as primary source (fallback to deviceType/name), because some API responses report Yuka Mini as generic Yuka.
+- ProductKey groups are synchronized from PyMammotion (`pymammotion/utility/device_type.py`) via `npm run sync:product-keys`.
+- GitHub workflow `.github/workflows/sync-product-keys.yml` can auto-check weekly and open a PR if new product keys/devices are added upstream.
 - Shared devices use Aliyun polling (no MQTT). This is normal and fully functional.
 
 ## Changelog
+
+### 0.0.6
+- New: Product-key sync from PyMammotion (`npm run sync:product-keys`) and optional weekly GitHub workflow PR automation
+- New: `devices.<id>.productKeyGroup` state for transparent model classification
+- Improved: product-key based model detection to better handle variants like Yuka Mini
 
 ### 0.0.5
 - Improved: Yuka compatibility for route execution (`startZones`/`startAllZones`/single zone)
 - Changed: model-aware limits for command states (including Yuka/Yuka Mini spacing ranges)
 - Changed: route reserved-byte mapping aligned with PyMammotion behavior
 - Changed: NAV receiver selection adjusted for route commands
-
-### 0.0.3 (upcoming)
-- Fixed: polling silently stops when device cache becomes empty (watchdog added)
-- Fixed: shared devices (owned: 0) not detected – legacy bindings now always merged
-- Fixed: modern API errors no longer crash the full device refresh
-- New: Zone / area management – `requestAreaNames` button, per-zone enable toggles, per-zone `start` button, `startZones` batch button
-- New: `routePayloadJson` string state for JS-adapter automations (full route payload as JSON)
-- Changed: `routeAreasCsv` renamed to `routeAreaIds` (existing values are migrated automatically)
 
 ### 0.0.4
 - New: `commands.payload` + `commands.lastPayload` for JSON-based command execution and traceability
@@ -243,6 +243,14 @@ setState('mammotion.0.devices.<deviceId>.commands.payload', JSON.stringify({
 - Changed: route reserved bytes and NAV receiver selection aligned to PyMammotion behavior (improves Yuka compatibility)
 - Changed: zone execution order via `zones.<name>.position` for `startZones` and `startAllZones`
 - Known issue: telemetry coverage is not complete yet (MQTT decoding/RTK fields still in progress)
+
+### 0.0.3
+- Fixed: polling silently stops when device cache becomes empty (watchdog added)
+- Fixed: shared devices (owned: 0) not detected – legacy bindings now always merged
+- Fixed: modern API errors no longer crash the full device refresh
+- New: Zone / area management – `requestAreaNames` button, per-zone enable toggles, per-zone `start` button, `startZones` batch button
+- New: `routePayloadJson` string state for JS-adapter automations (full route payload as JSON)
+- Changed: `routeAreasCsv` renamed to `routeAreaIds` (existing values are migrated automatically)
 
 ### 0.0.2
 - Improved telemetry refresh strategy (adaptive polling + post-command sync)

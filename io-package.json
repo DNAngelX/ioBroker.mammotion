@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "mammotion",
-    "version": "0.0.5",
+    "version": "0.0.6",
     "news": {
+      "0.0.6": {
+        "en": "Added product-key sync from PyMammotion (manual script + optional GitHub workflow), improved product-key based model detection (including Yuka Mini), and exposed devices.<id>.productKeyGroup.",
+        "de": "Produkt-Key-Sync aus PyMammotion hinzugefuegt (manuelles Script + optionaler GitHub-Workflow), produkt-key-basierte Modell-Erkennung verbessert (inkl. Yuka Mini) und devices.<id>.productKeyGroup bereitgestellt.",
+        "ru": "Добавлена синхронизация product key из PyMammotion (ручной скрипт + опциональный workflow GitHub), улучшено определение модели по product key (включая Yuka Mini) и добавлен devices.<id>.productKeyGroup.",
+        "pt": "Adicionada sincronizacao de product key do PyMammotion (script manual + workflow opcional no GitHub), melhorada a deteccao de modelo por product key (incluindo Yuka Mini) e exposto devices.<id>.productKeyGroup.",
+        "nl": "Product-key synchronisatie uit PyMammotion toegevoegd (handmatig script + optionele GitHub-workflow), modeldetectie op basis van product key verbeterd (incl. Yuka Mini) en devices.<id>.productKeyGroup toegevoegd.",
+        "fr": "Ajout de la synchronisation des product keys depuis PyMammotion (script manuel + workflow GitHub optionnel), amelioration de la detection de modele via product key (y compris Yuka Mini) et ajout de devices.<id>.productKeyGroup.",
+        "it": "Aggiunta la sincronizzazione dei product key da PyMammotion (script manuale + workflow GitHub opzionale), migliorato il rilevamento modello basato su product key (incluso Yuka Mini) ed esposto devices.<id>.productKeyGroup.",
+        "es": "Anadida la sincronizacion de product key desde PyMammotion (script manual + workflow opcional de GitHub), mejorada la deteccion de modelo por product key (incluido Yuka Mini) y expuesto devices.<id>.productKeyGroup.",
+        "pl": "Dodano synchronizacje product key z PyMammotion (reczny skrypt + opcjonalny workflow GitHub), ulepszono wykrywanie modelu po product key (w tym Yuka Mini) oraz dodano devices.<id>.productKeyGroup.",
+        "uk": "Додано синхронізацію product key з PyMammotion (ручний скрипт + опціональний workflow GitHub), покращено визначення моделі за product key (включно з Yuka Mini) та додано devices.<id>.productKeyGroup.",
+        "zh-cn": "新增从 PyMammotion 同步 product key（手动脚本 + 可选 GitHub 工作流），改进基于 product key 的机型识别（包括 Yuka Mini），并新增 devices.<id>.productKeyGroup。"
+      },
       "0.0.5": {
         "en": "Improved Yuka compatibility: model-aware limits (e.g. Yuka Mini lane width), route reserved-byte mapping aligned, and receiver selection adjusted for route commands.",
         "de": "Yuka-Kompatibilitaet verbessert: modellabhaengige Limits (z. B. Yuka Mini Bahnbreite), Route-Reserved-Bytes angepasst und Receiver-Auswahl fuer Route-Befehle korrigiert.",

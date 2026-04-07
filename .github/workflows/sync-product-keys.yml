@@ -1,0 +1,38 @@
+name: Sync product keys
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Sync from PyMammotion
+        run: npm run sync:product-keys
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "chore: sync product keys from PyMammotion"
+          title: "chore: sync product keys from PyMammotion"
+          body: |
+            Automated sync from:
+            `pymammotion/utility/device_type.py`
+          branch: chore/sync-product-keys
+          delete-branch: true
+          labels: |
+            maintenance

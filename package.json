@@ -1,6 +1,6 @@
 {
   "name": "iobroker.mammotion",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Control Mammotion Luba mower via cloud/MQTT",
   "author": {
     "name": "DNAngel",
@@ -69,6 +69,7 @@
     "test": "npm run test:ts && npm run test:package",
     "check": "tsc --noEmit",
     "lint": "eslint -c eslint.config.mjs .",
+    "sync:product-keys": "node scripts/sync-product-keys.mjs",
     "translate": "translate-adapter",
     "release": "release-script",
     "dev-server": "dev-server"
