@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "mammotion",
-    "version": "0.0.7",
+    "version": "0.0.8",
     "news": {
+      "0.0.8": {
+        "en": "Fix uncaught connack timeout crash: MQTT event handlers are now wrapped in try-catch and a no-op error listener is attached before teardown to prevent unhandled exceptions during shutdown or reconnect.",
+        "de": "Absturz durch uncaught connack timeout behoben: MQTT-Event-Handler sind jetzt in try-catch eingebettet und vor dem Teardown wird ein leerer Error-Listener gesetzt.",
+        "ru": "Исправлен краш из-за uncaught connack timeout: обработчики MQTT обёрнуты в try-catch, перед teardown устанавливается пустой error-listener.",
+        "pt": "Corrigido crash por connack timeout nao tratado: handlers MQTT agora estao em try-catch e um listener de erro vazio e anexado antes do teardown.",
+        "nl": "Crash door uncaught connack timeout opgelost: MQTT handlers gewrapped in try-catch, lege error listener voor teardown.",
+        "fr": "Correction du crash connack timeout non gere : handlers MQTT en try-catch, ecouteur d'erreur vide avant teardown.",
+        "it": "Corretto crash connack timeout: handler MQTT in try-catch, listener errore vuoto prima del teardown.",
+        "es": "Corregido crash connack timeout: handlers MQTT en try-catch, listener de error vacio antes del teardown.",
+        "pl": "Naprawiono crash connack timeout: handlery MQTT w try-catch, pusty error listener przed teardown.",
+        "uk": "Виправлено краш connack timeout: обробники MQTT у try-catch, порожній error-listener перед teardown.",
+        "zh-cn": "修复 connack timeout 未捕获崩溃：MQTT 处理器包裹在 try-catch 中，销毁前附加空 error listener。"
+      },
       "0.0.7": {
         "en": "Stabilized zone discovery and zone object creation: per-device discovery lock prevents parallel runs, retries for unknown hash classifications were improved, and fallback zone naming now guarantees unique and gap-free Area IDs.",
         "de": "Zonen-Erkennung und Zonen-Objektanlage stabilisiert: Ein Discovery-Lock pro Geraet verhindert parallele Laeufe, Retries fuer unbekannte Hash-Klassifizierungen wurden verbessert und das Fallback-Namensschema erzeugt eindeutige sowie lueckenfreie Area-IDs.",

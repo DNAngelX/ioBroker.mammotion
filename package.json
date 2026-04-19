@@ -1,6 +1,6 @@
 {
   "name": "iobroker.mammotion",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Control Mammotion Luba mower via cloud/MQTT",
   "author": {
     "name": "DNAngel",

@@ -1336,21 +1336,33 @@ class Mammotion extends utils.Adapter {
         });
 
         client.on('error', (err: Error) => {
-            this.log.warn(`MQTT error: ${err.message}`);
-            void this.setStateChangedAsync('info.lastError', `MQTT: ${err.message}`, true);
-            void this.ensureAliyunMqttRunning('jwt-error');
+            try {
+                this.log.warn(`MQTT error: ${err.message}`);
+                void this.setStateChangedAsync('info.lastError', `MQTT: ${err.message}`, true);
+                void this.ensureAliyunMqttRunning('jwt-error');
+            } catch {
+                // adapter may be shutting down
+            }
         });
 
         client.on('close', () => {
-            this.setJwtMqttConnected(false);
-            this.log.debug('JWT MQTT connection closed');
-            void this.ensureAliyunMqttRunning('jwt-close');
+            try {
+                this.setJwtMqttConnected(false);
+                this.log.debug('JWT MQTT connection closed');
+                void this.ensureAliyunMqttRunning('jwt-close');
+            } catch {
+                // adapter may be shutting down
+            }
         });
 
         client.on('offline', () => {
-            this.setJwtMqttConnected(false);
-            this.log.debug('JWT MQTT offline');
-            void this.ensureAliyunMqttRunning('jwt-offline');
+            try {
+                this.setJwtMqttConnected(false);
+                this.log.debug('JWT MQTT offline');
+                void this.ensureAliyunMqttRunning('jwt-offline');
+            } catch {
+                // adapter may be shutting down
+            }
         });
     }
 
@@ -3692,18 +3704,30 @@ class Mammotion extends utils.Adapter {
         });
 
         client.on('error', (err: Error) => {
-            this.log.warn(`Aliyun IoT MQTT error: ${err.message}`);
-            void this.setStateChangedAsync('info.lastError', `Aliyun MQTT: ${err.message}`, true);
+            try {
+                this.log.warn(`Aliyun IoT MQTT error: ${err.message}`);
+                void this.setStateChangedAsync('info.lastError', `Aliyun MQTT: ${err.message}`, true);
+            } catch {
+                // adapter may be shutting down
+            }
         });
 
         client.on('close', () => {
-            this.setAliyunMqttConnected(false);
-            this.log.debug('Aliyun MQTT connection closed');
+            try {
+                this.setAliyunMqttConnected(false);
+                this.log.debug('Aliyun MQTT connection closed');
+            } catch {
+                // adapter may be shutting down
+            }
         });
 
         client.on('offline', () => {
-            this.setAliyunMqttConnected(false);
-            this.log.debug('Aliyun MQTT offline');
+            try {
+                this.setAliyunMqttConnected(false);
+                this.log.debug('Aliyun MQTT offline');
+            } catch {
+                // adapter may be shutting down
+            }
         });
     }
 
