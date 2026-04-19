@@ -3,5 +3,14 @@
     "email": "E-Mail",
     "password": "Passwort",
     "deviceUuid": "Geräte-UUID",
-    "storeDebugPayloads": "Debug-Payloads speichern"
+    "storeDebugPayloads": "Debug-Payloads speichern",
+    "emailHint": "E-Mail des Mammotion-Kontos",
+    "deviceUuidHint": "Standardwert lassen, ausser du willst deine eigene Device-ID nachbilden",
+    "legacyPollIntervalSec": "Legacy Poll Intervall (s)",
+    "legacyPollIntervalSecHint": "Nur bei Legacy/Aliyun-Telemetrie aktiv. Bereich: 10-300 Sekunden.",
+    "legacyTelemetryTransport": "Legacy Telemetrie-Transport",
+    "legacyTelemetryTransportHint": "MQTT Push ist experimentell; Polling wird aktuell empfohlen.",
+    "legacyTelemetryTransportPoll": "Polling (stabil)",
+    "legacyTelemetryTransportMqtt": "MQTT Push (experimentell)",
+    "storeDebugPayloadsHint": "Speichert lastPayload und lastProtoContent. Nur fuer Analyse aktivieren."
 }

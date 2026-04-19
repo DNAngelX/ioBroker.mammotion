@@ -2,5 +2,14 @@
     "mammotion adapter settings": "mammotion的适配器设置",
     "email": "邮箱",
     "password": "密码",
-    "deviceUuid": "设备UUID"
+    "deviceUuid": "设备UUID",
+    "emailHint": "Mammotion account email",
+    "deviceUuidHint": "Leave default unless you want to mimic your own device id",
+    "legacyPollIntervalSec": "Legacy poll interval (s)",
+    "legacyPollIntervalSecHint": "Only used for legacy/Aliyun telemetry. Range: 10-300 seconds.",
+    "legacyTelemetryTransport": "Legacy telemetry transport",
+    "legacyTelemetryTransportHint": "MQTT push is experimental; polling is currently recommended.",
+    "legacyTelemetryTransportPoll": "Polling (stable)",
+    "legacyTelemetryTransportMqtt": "MQTT push (experimental)",
+    "storeDebugPayloadsHint": "Stores lastPayload and lastProtoContent. Enable only for analysis."
 }

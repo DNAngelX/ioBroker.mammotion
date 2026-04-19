@@ -221,12 +221,14 @@ class Mammotion extends utils.Adapter {
         try {
             if (this.mqttClient) {
                 this.mqttClient.removeAllListeners();
+                this.mqttClient.on('error', () => {});
                 this.mqttClient.end(true);
                 this.mqttClient = null;
             }
             this.jwtMqttConnected = false;
             if (this.aliyunMqttClient) {
                 this.aliyunMqttClient.removeAllListeners();
+                this.aliyunMqttClient.on('error', () => {});
                 this.aliyunMqttClient.end(true);
                 this.aliyunMqttClient = null;
             }
@@ -1272,6 +1274,7 @@ class Mammotion extends utils.Adapter {
     private async connectMqtt(mqttAuth: MqttConnection, records: DeviceRecord[]): Promise<void> {
         if (this.mqttClient) {
             this.mqttClient.removeAllListeners();
+            this.mqttClient.on('error', () => {}); // prevent uncaught connack timeout after teardown
             this.mqttClient.end(true);
             this.setJwtMqttConnected(false);
         }
@@ -3604,6 +3607,7 @@ class Mammotion extends utils.Adapter {
         }
         if (this.aliyunMqttClient) {
             this.aliyunMqttClient.removeAllListeners();
+            this.aliyunMqttClient.on('error', () => {}); // prevent uncaught connack timeout after teardown
             this.aliyunMqttClient.end(true);
             this.aliyunMqttClient = null;
             this.setAliyunMqttConnected(false);

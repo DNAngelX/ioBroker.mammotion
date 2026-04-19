@@ -5,7 +5,7 @@
         "email": {
             "type": "text",
             "label": "email",
-            "hint": "mammotion account email",
+            "hint": "emailHint",
             "newLine": true,
             "xs": 12,
             "sm": 12,
@@ -26,7 +26,7 @@
         "deviceUuid": {
             "type": "text",
             "label": "deviceUuid",
-            "hint": "leave default unless you want to mimic your own device id",
+            "hint": "deviceUuidHint",
             "newLine": true,
             "xs": 12,
             "sm": 12,
@@ -36,8 +36,8 @@
         },
         "legacyPollIntervalSec": {
             "type": "number",
-            "label": "Legacy Poll Intervall (s)",
-            "hint": "Nur bei Legacy/Aliyun Telemetrie aktiv. Bereich 10-300 Sekunden.",
+            "label": "legacyPollIntervalSec",
+            "hint": "legacyPollIntervalSecHint",
             "newLine": true,
             "min": 10,
             "max": 300,
@@ -50,17 +50,17 @@
         },
         "legacyTelemetryTransport": {
             "type": "select",
-            "label": "Legacy Telemetrie",
-            "hint": "MQTT Push folgt spaeter; aktuell nutzt der Adapter Polling.",
+            "label": "legacyTelemetryTransport",
+            "hint": "legacyTelemetryTransportHint",
             "newLine": true,
             "options": [
                 {
                     "value": "poll",
-                    "label": "Polling (stabil)"
+                    "label": "legacyTelemetryTransportPoll"
                 },
                 {
                     "value": "mqtt",
-                    "label": "MQTT Push (experimental)"
+                    "label": "legacyTelemetryTransportMqtt"
                 }
             ],
             "xs": 12,
@@ -72,7 +72,7 @@
         "storeDebugPayloads": {
             "type": "checkbox",
             "label": "storeDebugPayloads",
-            "hint": "Speichert lastPayload und lastProtoContent. Nur fuer Analyse aktivieren.",
+            "hint": "storeDebugPayloadsHint",
             "newLine": true,
             "xs": 12,
             "sm": 12,
