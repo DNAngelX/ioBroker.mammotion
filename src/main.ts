@@ -132,6 +132,10 @@ const ACTIVE_DEVICE_STATES = new Set<number>([13, 14, 19, 20, 31, 32, 34, 35, 36
 const IDLE_DEVICE_STATES = new Set<number>([0, 1, 2, 8, 10, 11, 12, 15, 16, 17, 22, 23, 39]);
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1000;
 const AREA_NAME_RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 60_000];
+const AREA_NAME_REQUEST_MIN_INTERVAL_MS = 8_000;
+const AREA_NAME_REQUEST_STEP_DELAY_MS = 800;
+const AREA_NAME_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const AREA_NAME_MISSING_REFRESH_MIN_INTERVAL_MS = 30_000;
 
 class Mammotion extends utils.Adapter {
     private mqttClient: any = null;
@@ -169,6 +173,11 @@ class Mammotion extends utils.Adapter {
     private zoneDiscoveryInFlight = new Set<string>();
     private areaNameRetryTimers = new Map<string, NodeJS.Timeout>();
     private areaNameRetryAttempts = new Map<string, number>();
+    private areaNameRequestInFlight = new Set<string>();
+    private areaNameLastRequestAt = new Map<string, number>();
+    private areaNameCooldownUntil = new Map<string, number>();
+    private areaNameMissingRequestInFlight = false;
+    private lastAreaNameMissingRequestAt = 0;
     /** Accumulator for multi-frame NavGetHashListAck messages, keyed by deviceKey. */
     private hashFrameAccumulator = new Map<string, { totalFrame: number; frames: Map<number, bigint[]> }>();
     /** Promise resolvers waiting for a specific field-33 response, keyed by "deviceKey:hash". */
@@ -247,6 +256,11 @@ class Mammotion extends utils.Adapter {
             this.pendingAreaNamesByDevice.clear();
             this.classifiedAreaHashesByDevice.clear();
             this.zoneDiscoveryInFlight.clear();
+            this.areaNameRequestInFlight.clear();
+            this.areaNameLastRequestAt.clear();
+            this.areaNameCooldownUntil.clear();
+            this.areaNameMissingRequestInFlight = false;
+            this.lastAreaNameMissingRequestAt = 0;
             this.stopLegacyPolling();
             this.syncConnectionStates();
             callback();
@@ -1326,9 +1340,7 @@ class Mammotion extends utils.Adapter {
 
             // Area-name responses are async over MQTT. If previous requests happened while
             // MQTT was down/flapping, retry only for devices without known areas.
-            void this.requestAreaNamesForMissingDevices().catch(err => {
-                this.log.debug(`Area-name re-request after JWT MQTT connect failed: ${this.extractAxiosError(err)}`);
-            });
+            this.triggerAreaNameMissingRequest('jwt-connect');
         });
 
         client.on('message', (topic: string, payload: Buffer) => {
@@ -3203,50 +3215,99 @@ class Mammotion extends utils.Adapter {
         return lubaMessage.toString('base64');
     }
 
-    private async sendAreaNameListRequest(context: DeviceContext): Promise<void> {
-        const primaryReceiver = this.getReceiverDevice(context);
-        const receivers = new Set<number>([primaryReceiver]);
-        // Some Yuka firmware revisions answer NavGetHashList only on receiver 17.
-        if (this.isYukaDevice(context)) {
-            receivers.add(17);
-            receivers.add(1);
+    private async sendAreaNameListRequest(context: DeviceContext): Promise<boolean> {
+        if (this.areaNameRequestInFlight.has(context.key)) {
+            this.log.debug(`[AREA-REQ] Request already in flight for ${context.deviceName || context.iotId}, skipping duplicate trigger.`);
+            return false;
+        }
+        if (!this.isMqttConnectedForAreaResponses()) {
+            this.log.debug(`[AREA-REQ] MQTT not connected yet for ${context.deviceName || context.iotId}, postponing request.`);
+            return false;
         }
 
-        // First try sub_cmd=3 (AppGetAllAreaHashName / field 61) – gives area hashes + names directly.
-        for (const receiver of receivers) {
+        const cooldownUntil = this.areaNameCooldownUntil.get(context.key) ?? 0;
+        const cooldownRemainingMs = cooldownUntil - Date.now();
+        if (cooldownRemainingMs > 0) {
             this.log.debug(
-                `[AREA-REQ] Sending sub_cmd=3 (AppGetAllAreaHashName) for ${context.deviceName || context.iotId}, receiver=${receiver}`,
+                `[AREA-REQ] Cooldown active for ${context.deviceName || context.iotId}, skipping for another ${Math.ceil(cooldownRemainingMs / 1000)}s.`,
             );
-            const result3 = await this.executeEncodedContentCommand(context, 'area-name-list-v3', (_session, ctx) =>
-                this.buildAreaNameListContent(_session, ctx, 3, receiver),
-            );
-            this.log.debug(
-                `[AREA-REQ] sub_cmd=3 response (receiver=${receiver}, len=${result3?.length ?? 0}): ${result3?.substring(0, 100)}`,
-            );
-            if (result3 && result3 !== 'ok' && result3.length > 20) {
-                const areas = this.tryParseAreaHashNames(result3);
-                if (areas && areas.length > 0) {
-                    this.rememberAreaNames(context.key, areas);
-                    this.log.debug(`[AREA-REQ] Names cached via sub_cmd=3: ${areas.length}`);
-                }
-            }
+            return false;
         }
 
-        // sub_cmd=0: device responds with NavGetHashListAck (field 31) → triggers field-32 classification
-        for (const receiver of receivers) {
-            const result0 = await this.executeEncodedContentCommand(context, 'area-name-list', (_session, ctx) =>
-                this.buildAreaNameListContent(_session, ctx, 0, receiver),
-            );
-            this.log.debug(
-                `[AREA-REQ] sub_cmd=0 response (receiver=${receiver}, len=${result0?.length ?? 0}): ${result0?.substring(0, 100)}`,
-            );
-            if (result0 && result0 !== 'ok' && result0.length > 20) {
-                const areas = this.tryParseAreaHashNames(result0);
-                if (areas && areas.length > 0) {
-                    this.rememberAreaNames(context.key, areas);
-                    this.log.debug(`[AREA-REQ] Names cached via sub_cmd=0: ${areas.length}`);
+        this.areaNameRequestInFlight.add(context.key);
+        try {
+            const lastAt = this.areaNameLastRequestAt.get(context.key) ?? 0;
+            const waitMs = AREA_NAME_REQUEST_MIN_INTERVAL_MS - (Date.now() - lastAt);
+            if (waitMs > 0) {
+                this.log.debug(`[AREA-REQ] Delaying request for ${context.deviceName || context.iotId} by ${waitMs}ms to avoid API throttling.`);
+                await this.sleepMs(waitMs);
+            }
+            this.areaNameLastRequestAt.set(context.key, Date.now());
+
+            const primaryReceiver = this.getReceiverDevice(context);
+            const receivers = new Set<number>([primaryReceiver]);
+            // Some Yuka firmware revisions answer NavGetHashList only on receiver 17.
+            if (this.isYukaDevice(context)) {
+                receivers.add(17);
+                receivers.add(1);
+            }
+
+            let firstCall = true;
+            // First try sub_cmd=3 (AppGetAllAreaHashName / field 61) – gives area hashes + names directly.
+            for (const receiver of receivers) {
+                if (!firstCall) {
+                    await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
+                }
+                firstCall = false;
+
+                this.log.debug(
+                    `[AREA-REQ] Sending sub_cmd=3 (AppGetAllAreaHashName) for ${context.deviceName || context.iotId}, receiver=${receiver}`,
+                );
+                const result3 = await this.executeEncodedContentCommand(context, 'area-name-list-v3', (_session, ctx) =>
+                    this.buildAreaNameListContent(_session, ctx, 3, receiver),
+                );
+                this.log.debug(
+                    `[AREA-REQ] sub_cmd=3 response (receiver=${receiver}, len=${result3?.length ?? 0}): ${result3?.substring(0, 100)}`,
+                );
+                if (result3 && result3 !== 'ok' && result3.length > 20) {
+                    const areas = this.tryParseAreaHashNames(result3);
+                    if (areas && areas.length > 0) {
+                        this.rememberAreaNames(context.key, areas);
+                        this.log.debug(`[AREA-REQ] Names cached via sub_cmd=3: ${areas.length}`);
+                    }
                 }
             }
+
+            // sub_cmd=0: device responds with NavGetHashListAck (field 31) → triggers field-32 classification
+            for (const receiver of receivers) {
+                await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
+                const result0 = await this.executeEncodedContentCommand(context, 'area-name-list', (_session, ctx) =>
+                    this.buildAreaNameListContent(_session, ctx, 0, receiver),
+                );
+                this.log.debug(
+                    `[AREA-REQ] sub_cmd=0 response (receiver=${receiver}, len=${result0?.length ?? 0}): ${result0?.substring(0, 100)}`,
+                );
+                if (result0 && result0 !== 'ok' && result0.length > 20) {
+                    const areas = this.tryParseAreaHashNames(result0);
+                    if (areas && areas.length > 0) {
+                        this.rememberAreaNames(context.key, areas);
+                        this.log.debug(`[AREA-REQ] Names cached via sub_cmd=0: ${areas.length}`);
+                    }
+                }
+            }
+            return true;
+        } catch (err) {
+            if (this.isRateLimitError(err)) {
+                this.areaNameCooldownUntil.set(context.key, Date.now() + AREA_NAME_RATE_LIMIT_COOLDOWN_MS);
+                this.log.warn(
+                    `[AREA-REQ] Rate limit hit for ${context.deviceName || context.iotId}. Backing off for ${
+                        AREA_NAME_RATE_LIMIT_COOLDOWN_MS / 1000
+                    }s.`,
+                );
+            }
+            throw err;
+        } finally {
+            this.areaNameRequestInFlight.delete(context.key);
         }
     }
 
@@ -3554,11 +3615,14 @@ class Mammotion extends utils.Adapter {
     private async requestAreaNamesForAllDevices(): Promise<void> {
         for (const ctx of this.deviceContexts.values()) {
             try {
-                await this.sendAreaNameListRequest(ctx);
-                this.startAreaNameRetry(ctx.key);
+                const requestSent = await this.sendAreaNameListRequest(ctx);
+                if (requestSent) {
+                    this.startAreaNameRetry(ctx.key);
+                }
             } catch (err) {
                 this.log.debug(`Area-name request failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
             }
+            await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
         }
     }
 
@@ -3569,14 +3633,38 @@ class Mammotion extends utils.Adapter {
                 continue;
             }
             try {
-                await this.sendAreaNameListRequest(ctx);
-                this.startAreaNameRetry(ctx.key);
+                const requestSent = await this.sendAreaNameListRequest(ctx);
+                if (requestSent) {
+                    this.startAreaNameRetry(ctx.key);
+                }
             } catch (err) {
                 this.log.debug(
                     `Area-Name-Re-Request (missing) failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`,
                 );
             }
+            await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
         }
+    }
+
+    private triggerAreaNameMissingRequest(reason: string): void {
+        if (this.areaNameMissingRequestInFlight) {
+            return;
+        }
+
+        const now = Date.now();
+        if (now - this.lastAreaNameMissingRequestAt < AREA_NAME_MISSING_REFRESH_MIN_INTERVAL_MS) {
+            return;
+        }
+        this.lastAreaNameMissingRequestAt = now;
+        this.areaNameMissingRequestInFlight = true;
+
+        void this.requestAreaNamesForMissingDevices()
+            .catch(err => {
+                this.log.debug(`Area-name re-request (${reason}) failed: ${this.extractAxiosError(err)}`);
+            })
+            .finally(() => {
+                this.areaNameMissingRequestInFlight = false;
+            });
     }
 
     private async callAepHandle(session: LegacySession): Promise<AliyunMqttCreds> {
@@ -3693,9 +3781,7 @@ class Mammotion extends utils.Adapter {
 
             // Re-request area names now that MQTT is connected and can receive the async response
             setTimeout(() => {
-                void this.requestAreaNamesForMissingDevices().catch(err => {
-                    this.log.debug(`Area-name re-request after MQTT connect failed: ${this.extractAxiosError(err)}`);
-                });
+                this.triggerAreaNameMissingRequest('aliyun-connect');
             }, 2_000);
         });
 
@@ -3739,10 +3825,14 @@ class Mammotion extends utils.Adapter {
             return;
         }
         try {
-            await this.sendAreaNameListRequest(ctx);
-            this.startAreaNameRetry(deviceKey);
+            const requestSent = await this.sendAreaNameListRequest(ctx);
+            if (requestSent) {
+                this.startAreaNameRetry(deviceKey);
+                this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
+            } else {
+                this.log.info(`Area-name request deferred for ${ctx.deviceName || ctx.iotId} (MQTT/cooldown/in-flight).`);
+            }
             await this.setStateChangedAsync(localId, false, true);
-            this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
@@ -4100,6 +4190,11 @@ class Mammotion extends utils.Adapter {
             this.clearAreaNameRetry(deviceKey);
             return;
         }
+        if (!this.isMqttConnectedForAreaResponses()) {
+            this.log.debug(`[AREA-REQ] Retry postponed for ${deviceKey}: MQTT not connected yet.`);
+            this.scheduleAreaNameRetry(deviceKey);
+            return;
+        }
 
         const ctx = this.deviceContexts.get(deviceKey);
         if (!ctx) {
@@ -4110,7 +4205,11 @@ class Mammotion extends utils.Adapter {
         const attempt = this.areaNameRetryAttempts.get(deviceKey) ?? 0;
         this.log.debug(`[AREA-REQ] retry ${attempt}/${AREA_NAME_RETRY_DELAYS_MS.length} for ${ctx.deviceName || ctx.iotId}`);
         try {
-            await this.sendAreaNameListRequest(ctx);
+            const requestSent = await this.sendAreaNameListRequest(ctx);
+            if (!requestSent) {
+                this.scheduleAreaNameRetry(deviceKey);
+                return;
+            }
         } catch (err) {
             this.log.debug(`[AREA-REQ] retry failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
         }
@@ -4120,6 +4219,25 @@ class Mammotion extends utils.Adapter {
             return;
         }
         this.scheduleAreaNameRetry(deviceKey);
+    }
+
+    private async sleepMs(ms: number): Promise<void> {
+        if (ms <= 0) {
+            return;
+        }
+        await new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    private isMqttConnectedForAreaResponses(): boolean {
+        return this.jwtMqttConnected || this.aliyunMqttConnected;
+    }
+
+    private isRateLimitError(err: unknown): boolean {
+        if (axios.isAxiosError(err) && err.response?.status === 429) {
+            return true;
+        }
+        const msg = this.extractAxiosError(err).toLowerCase();
+        return msg.includes('status code 429') || msg.includes('too many requests') || msg.includes('rate limit');
     }
 
     private async collectOrderedZoneHashes(

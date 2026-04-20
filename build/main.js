@@ -144,6 +144,10 @@ const ACTIVE_DEVICE_STATES = /* @__PURE__ */ new Set([13, 14, 19, 20, 31, 32, 34
 const IDLE_DEVICE_STATES = /* @__PURE__ */ new Set([0, 1, 2, 8, 10, 11, 12, 15, 16, 17, 22, 23, 39]);
 const LEGACY_FAST_POLL_WINDOW_MS = 2 * 60 * 1e3;
 const AREA_NAME_RETRY_DELAYS_MS = [5e3, 1e4, 2e4, 3e4, 6e4];
+const AREA_NAME_REQUEST_MIN_INTERVAL_MS = 8e3;
+const AREA_NAME_REQUEST_STEP_DELAY_MS = 800;
+const AREA_NAME_RATE_LIMIT_COOLDOWN_MS = 6e4;
+const AREA_NAME_MISSING_REFRESH_MIN_INTERVAL_MS = 3e4;
 class Mammotion extends utils.Adapter {
   mqttClient = null;
   session = null;
@@ -180,6 +184,11 @@ class Mammotion extends utils.Adapter {
   zoneDiscoveryInFlight = /* @__PURE__ */ new Set();
   areaNameRetryTimers = /* @__PURE__ */ new Map();
   areaNameRetryAttempts = /* @__PURE__ */ new Map();
+  areaNameRequestInFlight = /* @__PURE__ */ new Set();
+  areaNameLastRequestAt = /* @__PURE__ */ new Map();
+  areaNameCooldownUntil = /* @__PURE__ */ new Map();
+  areaNameMissingRequestInFlight = false;
+  lastAreaNameMissingRequestAt = 0;
   /** Accumulator for multi-frame NavGetHashListAck messages, keyed by deviceKey. */
   hashFrameAccumulator = /* @__PURE__ */ new Map();
   /** Promise resolvers waiting for a specific field-33 response, keyed by "deviceKey:hash". */
@@ -251,6 +260,11 @@ class Mammotion extends utils.Adapter {
       this.pendingAreaNamesByDevice.clear();
       this.classifiedAreaHashesByDevice.clear();
       this.zoneDiscoveryInFlight.clear();
+      this.areaNameRequestInFlight.clear();
+      this.areaNameLastRequestAt.clear();
+      this.areaNameCooldownUntil.clear();
+      this.areaNameMissingRequestInFlight = false;
+      this.lastAreaNameMissingRequestAt = 0;
       this.stopLegacyPolling();
       this.syncConnectionStates();
       callback();
@@ -1193,9 +1207,7 @@ class Mammotion extends utils.Adapter {
           }
         });
       }
-      void this.requestAreaNamesForMissingDevices().catch((err) => {
-        this.log.debug(`Area-name re-request after JWT MQTT connect failed: ${this.extractAxiosError(err)}`);
-      });
+      this.triggerAreaNameMissingRequest("jwt-connect");
     });
     client.on("message", (topic, payload) => {
       void this.handleMqttMessage(topic, payload);
@@ -2767,49 +2779,92 @@ ${url}`;
     return lubaMessage.toString("base64");
   }
   async sendAreaNameListRequest(context) {
-    var _a, _b;
-    const primaryReceiver = this.getReceiverDevice(context);
-    const receivers = /* @__PURE__ */ new Set([primaryReceiver]);
-    if (this.isYukaDevice(context)) {
-      receivers.add(17);
-      receivers.add(1);
+    var _a, _b, _c, _d;
+    if (this.areaNameRequestInFlight.has(context.key)) {
+      this.log.debug(`[AREA-REQ] Request already in flight for ${context.deviceName || context.iotId}, skipping duplicate trigger.`);
+      return false;
     }
-    for (const receiver of receivers) {
+    if (!this.isMqttConnectedForAreaResponses()) {
+      this.log.debug(`[AREA-REQ] MQTT not connected yet for ${context.deviceName || context.iotId}, postponing request.`);
+      return false;
+    }
+    const cooldownUntil = (_a = this.areaNameCooldownUntil.get(context.key)) != null ? _a : 0;
+    const cooldownRemainingMs = cooldownUntil - Date.now();
+    if (cooldownRemainingMs > 0) {
       this.log.debug(
-        `[AREA-REQ] Sending sub_cmd=3 (AppGetAllAreaHashName) for ${context.deviceName || context.iotId}, receiver=${receiver}`
+        `[AREA-REQ] Cooldown active for ${context.deviceName || context.iotId}, skipping for another ${Math.ceil(cooldownRemainingMs / 1e3)}s.`
       );
-      const result3 = await this.executeEncodedContentCommand(
-        context,
-        "area-name-list-v3",
-        (_session, ctx) => this.buildAreaNameListContent(_session, ctx, 3, receiver)
-      );
-      this.log.debug(
-        `[AREA-REQ] sub_cmd=3 response (receiver=${receiver}, len=${(_a = result3 == null ? void 0 : result3.length) != null ? _a : 0}): ${result3 == null ? void 0 : result3.substring(0, 100)}`
-      );
-      if (result3 && result3 !== "ok" && result3.length > 20) {
-        const areas = this.tryParseAreaHashNames(result3);
-        if (areas && areas.length > 0) {
-          this.rememberAreaNames(context.key, areas);
-          this.log.debug(`[AREA-REQ] Names cached via sub_cmd=3: ${areas.length}`);
+      return false;
+    }
+    this.areaNameRequestInFlight.add(context.key);
+    try {
+      const lastAt = (_b = this.areaNameLastRequestAt.get(context.key)) != null ? _b : 0;
+      const waitMs = AREA_NAME_REQUEST_MIN_INTERVAL_MS - (Date.now() - lastAt);
+      if (waitMs > 0) {
+        this.log.debug(`[AREA-REQ] Delaying request for ${context.deviceName || context.iotId} by ${waitMs}ms to avoid API throttling.`);
+        await this.sleepMs(waitMs);
+      }
+      this.areaNameLastRequestAt.set(context.key, Date.now());
+      const primaryReceiver = this.getReceiverDevice(context);
+      const receivers = /* @__PURE__ */ new Set([primaryReceiver]);
+      if (this.isYukaDevice(context)) {
+        receivers.add(17);
+        receivers.add(1);
+      }
+      let firstCall = true;
+      for (const receiver of receivers) {
+        if (!firstCall) {
+          await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
+        }
+        firstCall = false;
+        this.log.debug(
+          `[AREA-REQ] Sending sub_cmd=3 (AppGetAllAreaHashName) for ${context.deviceName || context.iotId}, receiver=${receiver}`
+        );
+        const result3 = await this.executeEncodedContentCommand(
+          context,
+          "area-name-list-v3",
+          (_session, ctx) => this.buildAreaNameListContent(_session, ctx, 3, receiver)
+        );
+        this.log.debug(
+          `[AREA-REQ] sub_cmd=3 response (receiver=${receiver}, len=${(_c = result3 == null ? void 0 : result3.length) != null ? _c : 0}): ${result3 == null ? void 0 : result3.substring(0, 100)}`
+        );
+        if (result3 && result3 !== "ok" && result3.length > 20) {
+          const areas = this.tryParseAreaHashNames(result3);
+          if (areas && areas.length > 0) {
+            this.rememberAreaNames(context.key, areas);
+            this.log.debug(`[AREA-REQ] Names cached via sub_cmd=3: ${areas.length}`);
+          }
         }
       }
-    }
-    for (const receiver of receivers) {
-      const result0 = await this.executeEncodedContentCommand(
-        context,
-        "area-name-list",
-        (_session, ctx) => this.buildAreaNameListContent(_session, ctx, 0, receiver)
-      );
-      this.log.debug(
-        `[AREA-REQ] sub_cmd=0 response (receiver=${receiver}, len=${(_b = result0 == null ? void 0 : result0.length) != null ? _b : 0}): ${result0 == null ? void 0 : result0.substring(0, 100)}`
-      );
-      if (result0 && result0 !== "ok" && result0.length > 20) {
-        const areas = this.tryParseAreaHashNames(result0);
-        if (areas && areas.length > 0) {
-          this.rememberAreaNames(context.key, areas);
-          this.log.debug(`[AREA-REQ] Names cached via sub_cmd=0: ${areas.length}`);
+      for (const receiver of receivers) {
+        await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
+        const result0 = await this.executeEncodedContentCommand(
+          context,
+          "area-name-list",
+          (_session, ctx) => this.buildAreaNameListContent(_session, ctx, 0, receiver)
+        );
+        this.log.debug(
+          `[AREA-REQ] sub_cmd=0 response (receiver=${receiver}, len=${(_d = result0 == null ? void 0 : result0.length) != null ? _d : 0}): ${result0 == null ? void 0 : result0.substring(0, 100)}`
+        );
+        if (result0 && result0 !== "ok" && result0.length > 20) {
+          const areas = this.tryParseAreaHashNames(result0);
+          if (areas && areas.length > 0) {
+            this.rememberAreaNames(context.key, areas);
+            this.log.debug(`[AREA-REQ] Names cached via sub_cmd=0: ${areas.length}`);
+          }
         }
       }
+      return true;
+    } catch (err) {
+      if (this.isRateLimitError(err)) {
+        this.areaNameCooldownUntil.set(context.key, Date.now() + AREA_NAME_RATE_LIMIT_COOLDOWN_MS);
+        this.log.warn(
+          `[AREA-REQ] Rate limit hit for ${context.deviceName || context.iotId}. Backing off for ${AREA_NAME_RATE_LIMIT_COOLDOWN_MS / 1e3}s.`
+        );
+      }
+      throw err;
+    } finally {
+      this.areaNameRequestInFlight.delete(context.key);
     }
   }
   buildNavGetCommDataContent(session, context, hash) {
@@ -3076,11 +3131,14 @@ ${url}`;
   async requestAreaNamesForAllDevices() {
     for (const ctx of this.deviceContexts.values()) {
       try {
-        await this.sendAreaNameListRequest(ctx);
-        this.startAreaNameRetry(ctx.key);
+        const requestSent = await this.sendAreaNameListRequest(ctx);
+        if (requestSent) {
+          this.startAreaNameRetry(ctx.key);
+        }
       } catch (err) {
         this.log.debug(`Area-name request failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
       }
+      await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
     }
   }
   async requestAreaNamesForMissingDevices() {
@@ -3090,14 +3148,33 @@ ${url}`;
         continue;
       }
       try {
-        await this.sendAreaNameListRequest(ctx);
-        this.startAreaNameRetry(ctx.key);
+        const requestSent = await this.sendAreaNameListRequest(ctx);
+        if (requestSent) {
+          this.startAreaNameRetry(ctx.key);
+        }
       } catch (err) {
         this.log.debug(
           `Area-Name-Re-Request (missing) failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`
         );
       }
+      await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
     }
+  }
+  triggerAreaNameMissingRequest(reason) {
+    if (this.areaNameMissingRequestInFlight) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastAreaNameMissingRequestAt < AREA_NAME_MISSING_REFRESH_MIN_INTERVAL_MS) {
+      return;
+    }
+    this.lastAreaNameMissingRequestAt = now;
+    this.areaNameMissingRequestInFlight = true;
+    void this.requestAreaNamesForMissingDevices().catch((err) => {
+      this.log.debug(`Area-name re-request (${reason}) failed: ${this.extractAxiosError(err)}`);
+    }).finally(() => {
+      this.areaNameMissingRequestInFlight = false;
+    });
   }
   async callAepHandle(session) {
     var _a;
@@ -3199,9 +3276,7 @@ ${url}`;
         });
       }
       setTimeout(() => {
-        void this.requestAreaNamesForMissingDevices().catch((err) => {
-          this.log.debug(`Area-name re-request after MQTT connect failed: ${this.extractAxiosError(err)}`);
-        });
+        this.triggerAreaNameMissingRequest("aliyun-connect");
       }, 2e3);
     });
     client.on("message", (topic, payload) => {
@@ -3237,10 +3312,14 @@ ${url}`;
       return;
     }
     try {
-      await this.sendAreaNameListRequest(ctx);
-      this.startAreaNameRetry(deviceKey);
+      const requestSent = await this.sendAreaNameListRequest(ctx);
+      if (requestSent) {
+        this.startAreaNameRetry(deviceKey);
+        this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
+      } else {
+        this.log.info(`Area-name request deferred for ${ctx.deviceName || ctx.iotId} (MQTT/cooldown/in-flight).`);
+      }
       await this.setStateChangedAsync(localId, false, true);
-      this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
     } catch (err) {
       const msg = this.extractAxiosError(err);
       await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
@@ -3559,6 +3638,11 @@ ${url}`;
       this.clearAreaNameRetry(deviceKey);
       return;
     }
+    if (!this.isMqttConnectedForAreaResponses()) {
+      this.log.debug(`[AREA-REQ] Retry postponed for ${deviceKey}: MQTT not connected yet.`);
+      this.scheduleAreaNameRetry(deviceKey);
+      return;
+    }
     const ctx = this.deviceContexts.get(deviceKey);
     if (!ctx) {
       this.clearAreaNameRetry(deviceKey);
@@ -3567,7 +3651,11 @@ ${url}`;
     const attempt = (_a = this.areaNameRetryAttempts.get(deviceKey)) != null ? _a : 0;
     this.log.debug(`[AREA-REQ] retry ${attempt}/${AREA_NAME_RETRY_DELAYS_MS.length} for ${ctx.deviceName || ctx.iotId}`);
     try {
-      await this.sendAreaNameListRequest(ctx);
+      const requestSent = await this.sendAreaNameListRequest(ctx);
+      if (!requestSent) {
+        this.scheduleAreaNameRetry(deviceKey);
+        return;
+      }
     } catch (err) {
       this.log.debug(`[AREA-REQ] retry failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
     }
@@ -3576,6 +3664,23 @@ ${url}`;
       return;
     }
     this.scheduleAreaNameRetry(deviceKey);
+  }
+  async sleepMs(ms) {
+    if (ms <= 0) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  isMqttConnectedForAreaResponses() {
+    return this.jwtMqttConnected || this.aliyunMqttConnected;
+  }
+  isRateLimitError(err) {
+    var _a;
+    if (import_axios.default.isAxiosError(err) && ((_a = err.response) == null ? void 0 : _a.status) === 429) {
+      return true;
+    }
+    const msg = this.extractAxiosError(err).toLowerCase();
+    return msg.includes("status code 429") || msg.includes("too many requests") || msg.includes("rate limit");
   }
   async collectOrderedZoneHashes(deviceKey, areas, predicate) {
     const selected = [];
