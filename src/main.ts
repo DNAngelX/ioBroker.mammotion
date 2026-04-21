@@ -135,7 +135,11 @@ const AREA_NAME_RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000, 60_000];
 const AREA_NAME_REQUEST_MIN_INTERVAL_MS = 8_000;
 const AREA_NAME_REQUEST_STEP_DELAY_MS = 800;
 const AREA_NAME_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const AREA_NAME_RATE_LIMIT_COOLDOWN_MAX_MS = 30 * 60 * 1000;
 const AREA_NAME_MISSING_REFRESH_MIN_INTERVAL_MS = 30_000;
+const LEGACY_PRODUCT_INFO_REFRESH_MS = 6 * 60 * 60 * 1000;
+const LEGACY_TSL_REFRESH_MS = 24 * 60 * 60 * 1000;
+const LEGACY_METADATA_RETRY_DELAY_MS = 10 * 60 * 1000;
 
 class Mammotion extends utils.Adapter {
     private mqttClient: any = null;
@@ -170,12 +174,19 @@ class Mammotion extends utils.Adapter {
     private lastRequestedHashSetByDevice = new Map<string, string>();
     private pendingAreaNamesByDevice = new Map<string, Map<string, string>>();
     private classifiedAreaHashesByDevice = new Map<string, Set<string>>();
+    private legacyProductInfoLastFetchAt = new Map<string, number>();
+    private legacyTslLastFetchAt = new Map<string, number>();
+    private legacyTslPropertiesByDevice = new Map<string, Map<string, LegacyTslPropertyDefinition>>();
     private zoneDiscoveryInFlight = new Set<string>();
+    private legacyOnlyCommandDevices = new Set<string>();
+    private dynamicJsonByState = new Map<string, string>();
     private areaNameRetryTimers = new Map<string, NodeJS.Timeout>();
     private areaNameRetryAttempts = new Map<string, number>();
     private areaNameRequestInFlight = new Set<string>();
     private areaNameLastRequestAt = new Map<string, number>();
+    private areaNameRequestRound = new Map<string, number>();
     private areaNameCooldownUntil = new Map<string, number>();
+    private areaNameRateLimitHits = new Map<string, number>();
     private areaNameMissingRequestInFlight = false;
     private lastAreaNameMissingRequestAt = 0;
     /** Accumulator for multi-frame NavGetHashListAck messages, keyed by deviceKey. */
@@ -210,7 +221,6 @@ class Mammotion extends utils.Adapter {
             await this.refreshSessionAndDeviceCache();
             await this.subscribeStatesAsync('devices.*.commands.*');
             await this.subscribeStatesAsync('devices.*.zones.*.start');
-            await this.requestIotSyncForAllDevices();
             await this.requestAreaNamesForAllDevices();
 
             this.log.info(
@@ -251,14 +261,21 @@ class Mammotion extends utils.Adapter {
             this.clearAutoApplyTimers(this.nonWorkAutoApplyTimers);
             this.clearAutoApplyTimers(this.startSettingsEnforceTimers);
             this.clearAutoApplyTimers(this.areaNameRetryTimers);
-            this.areaNameRetryAttempts.clear();
             this.lastRequestedHashSetByDevice.clear();
             this.pendingAreaNamesByDevice.clear();
             this.classifiedAreaHashesByDevice.clear();
+            this.legacyProductInfoLastFetchAt.clear();
+            this.legacyTslLastFetchAt.clear();
+            this.legacyTslPropertiesByDevice.clear();
+            this.legacyOnlyCommandDevices.clear();
+            this.dynamicJsonByState.clear();
             this.zoneDiscoveryInFlight.clear();
+            this.areaNameRetryAttempts.clear();
             this.areaNameRequestInFlight.clear();
             this.areaNameLastRequestAt.clear();
+            this.areaNameRequestRound.clear();
             this.areaNameCooldownUntil.clear();
+            this.areaNameRateLimitHits.clear();
             this.areaNameMissingRequestInFlight = false;
             this.lastAreaNameMissingRequestAt = 0;
             this.stopLegacyPolling();
@@ -1196,6 +1213,11 @@ class Mammotion extends utils.Adapter {
         this.lastRequestedHashSetByDevice.clear();
         this.pendingAreaNamesByDevice.clear();
         this.classifiedAreaHashesByDevice.clear();
+        this.legacyTslPropertiesByDevice.clear();
+        this.legacyOnlyCommandDevices.clear();
+        this.dynamicJsonByState.clear();
+        this.areaNameRateLimitHits.clear();
+        this.areaNameRequestRound.clear();
 
         const devicesByIotId = new Map<string, MammotionDevice>();
         const recordsByIotId = new Map<string, DeviceRecord>();
@@ -1322,6 +1344,7 @@ class Mammotion extends utils.Adapter {
                     topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/model/down_raw`);
                     topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/_thing/event/notify`);
                     topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/event/property/post_reply`);
+                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/service/invoke/reply`);
                     topics.add(`/sys/${record.productKey}/${record.deviceName}/thing/event/property/post`);
                 }
             }
@@ -1338,9 +1361,8 @@ class Mammotion extends utils.Adapter {
                 });
             }
 
-            // Area-name responses are async over MQTT. If previous requests happened while
-            // MQTT was down/flapping, retry only for devices without known areas.
-            this.triggerAreaNameMissingRequest('jwt-connect');
+            // JWT connection may flap quickly for shared devices; area-name refresh is triggered
+            // on the Aliyun fallback channel to avoid excessive request bursts.
         });
 
         client.on('message', (topic: string, payload: Buffer) => {
@@ -1501,6 +1523,7 @@ class Mammotion extends utils.Adapter {
                         `/sys/${payloadPk}/${payloadDn}/app/down/thing/model/down_raw`,
                         `/sys/${payloadPk}/${payloadDn}/app/down/_thing/event/notify`,
                         `/sys/${payloadPk}/${payloadDn}/app/down/thing/event/property/post_reply`,
+                        `/sys/${payloadPk}/${payloadDn}/app/down/thing/service/invoke/reply`,
                     ];
                     for (const dt of deviceTopics) {
                         mqttClient.subscribe(dt, { qos: 1 }, (err: Error | null) => {
@@ -1617,17 +1640,45 @@ class Mammotion extends utils.Adapter {
             const taskArea = this.pickNumber((deviceOtherInfoMqtt as Record<string, any>).task_area);
             if (taskArea !== null) await this.setStateChangedAsync(`${channelId}.telemetry.taskAreaM2`, taskArea, true);
         }
+        await this.applyLegacyTslValuesFromPayload(
+            deviceKey,
+            channelId,
+            params && typeof params === 'object' ? params : undefined,
+            data && typeof data === 'object' ? data : undefined,
+        );
 
-        // Extract proto content from various known JSON paths
-        const protoContent =
-            params?.value?.content ??
-            data?.value?.content ??
-            params?.content ??
-            data?.content ??
-            params?.items?.content?.value ??
-            params?.items?.content ??
-            data?.items?.content?.value ??
-            data?.items?.content;
+        // Extract proto content from various known JSON paths.
+        // Zone-related invoke replies often arrive as:
+        // /app/down/thing/service/invoke/reply with output.content.
+        const parsedParamsOutput =
+            typeof params?.output === 'string'
+                ? this.safeJsonParse<Record<string, any>>(params.output)
+                : undefined;
+        const parsedDataOutput =
+            typeof data?.output === 'string'
+                ? this.safeJsonParse<Record<string, any>>(data.output)
+                : undefined;
+        const protoCandidates = [
+            params?.value?.content,
+            data?.value?.content,
+            params?.content,
+            data?.content,
+            params?.items?.content?.value,
+            params?.items?.content,
+            data?.items?.content?.value,
+            data?.items?.content,
+            params?.output?.content,
+            data?.output?.content,
+            parsedParamsOutput?.content,
+            parsedDataOutput?.content,
+            params?.data?.content,
+            data?.data?.content,
+            params?.data?.output?.content,
+            data?.data?.output?.content,
+            params?.result?.content,
+            data?.result?.content,
+        ];
+        const protoContent = protoCandidates.find(value => typeof value === 'string' && value.length > 16);
         this.log.debug(`[MQTT] params top-level keys: ${Object.keys(params ?? {}).join(',')}`);
         if (typeof protoContent === 'string') {
             this.log.debug(`[MQTT] protoContent found (len=${protoContent.length})`);
@@ -1651,7 +1702,13 @@ class Mammotion extends utils.Adapter {
                 this.log.debug(`[MQTT] protoContent contains no zone names / no HashListAck`);
             }
         } else {
-            this.log.debug(`[MQTT] No protoContent found. params.value=${(JSON.stringify(params?.value) ?? '(none)').substring(0, 200)}`);
+            if (topic.includes('/thing/service/invoke/reply')) {
+                this.log.debug(
+                    `[MQTT] invoke/reply without protoContent. params=${(JSON.stringify(params) ?? '(none)').substring(0, 400)}`,
+                );
+            } else {
+                this.log.debug(`[MQTT] No protoContent found. params.value=${(JSON.stringify(params?.value) ?? '(none)').substring(0, 200)}`);
+            }
         }
     }
 
@@ -1697,19 +1754,24 @@ class Mammotion extends utils.Adapter {
         context: DeviceContext,
         content: string,
     ): Promise<string> {
+        if (this.legacyOnlyCommandDevices.has(context.key)) {
+            return this.invokeTaskControlCommandLegacy(session, context, content);
+        }
         try {
             return await this.invokeTaskControlCommandModern(session, context, content);
         } catch (err) {
             const msg = this.extractAxiosError(err).toLowerCase();
+            this.log.debug(`[MODERN-INVOKE] failed for ${context.deviceName || context.iotId}: ${msg}`);
             // Fall through to legacy for "Invalid device" (Luba1/legacy devices) and
             // "Access to this resource requires authentication" (shared-account devices).
             // Legacy uses iotToken which is independent of the modern Bearer JWT.
             if (!msg.includes('invalid device') && !msg.includes('access to this resource')) {
                 throw err;
             }
+            this.legacyOnlyCommandDevices.add(context.key);
         }
 
-        this.log.warn(`Modern command path returned Invalid device for ${context.deviceName || context.iotId}, trying Aliyun fallback.`);
+        this.log.warn(`Modern command path not supported for ${context.deviceName || context.iotId}, using Aliyun fallback.`);
         return this.invokeTaskControlCommandLegacy(session, context, content);
     }
 
@@ -1779,10 +1841,12 @@ class Mammotion extends utils.Adapter {
         commandLabel: string,
         buildContent: (session: AuthSession, context: DeviceContext) => string,
     ): Promise<string> {
+        const invokeCommand = async (session: AuthSession, ctx: DeviceContext, content: string): Promise<string> =>
+            this.invokeTaskControlCommandWithFallback(session, ctx, content);
         const session = await this.ensureValidSession(!this.cloudConnected);
         const content = buildContent(session, context);
         try {
-            return await this.invokeTaskControlCommandWithFallback(session, context, content);
+            return await invokeCommand(session, context, content);
         } catch (err) {
             const msg = this.extractAxiosError(err);
             if (!this.isRetryableCommandError(msg, err)) {
@@ -1795,7 +1859,7 @@ class Mammotion extends utils.Adapter {
             const refreshedContext = this.deviceContexts.get(context.key) || context;
             const retrySession = await this.ensureValidSession(true);
             const retryContent = buildContent(retrySession, refreshedContext);
-            return this.invokeTaskControlCommandWithFallback(retrySession, refreshedContext, retryContent);
+            return invokeCommand(retrySession, refreshedContext, retryContent);
         }
     }
 
@@ -1833,6 +1897,13 @@ class Mammotion extends utils.Adapter {
 
         await this.syncDevices(devices, records);
         await this.setStateChangedAsync('info.deviceCount', this.deviceContexts.size, true);
+        for (const context of this.deviceContexts.values()) {
+            try {
+                await this.refreshLegacyMetadataForDevice(session, context);
+            } catch (err) {
+                this.log.debug(`Initial legacy metadata refresh failed for ${context.deviceName || context.iotId}: ${this.extractAxiosError(err)}`);
+            }
+        }
 
         // Try JWT MQTT for ALL records (modern or legacy/shared).
         // With owner credentias this grants ACL to physical device topics (thing/event/+/post)
@@ -1954,7 +2025,6 @@ class Mammotion extends utils.Adapter {
         try {
             this.log.info('Auth cooldown elapsed, attempting reconnect.');
             await this.refreshSessionAndDeviceCache();
-            await this.requestIotSyncForAllDevices();
             this.setCloudConnected(true);
             this.authFailureSince = 0;
         } catch (err) {
@@ -2223,9 +2293,9 @@ class Mammotion extends utils.Adapter {
         const baseSec = Number.isFinite(configuredInterval)
             ? Math.min(300, Math.max(10, Math.trunc(configuredInterval)))
             : 30;
-        const activeSec = Math.min(60, Math.max(15, Math.trunc(baseSec / 2)));
-        const idleSec = Math.min(300, Math.max(120, baseSec * 4));
-        const boostSec = Math.max(10, Math.min(15, activeSec));
+        const activeSec = Math.min(30, Math.max(15, Math.trunc(baseSec)));
+        const idleSec = 300;
+        const boostSec = 15;
         if (Date.now() < this.legacyFastPollUntil) {
             return boostSec * 1000;
         }
@@ -2326,6 +2396,11 @@ class Mammotion extends utils.Adapter {
                 }
                 this.log.debug(`Legacy telemetry (status) failed for ${ctx.deviceName || ctx.iotId}: ${msg}`);
             }
+            try {
+                await this.refreshLegacyMetadataForDevice(session, ctx);
+            } catch (err) {
+                this.log.debug(`Legacy metadata refresh failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
+            }
 
             const [deviceState, connected] = await Promise.all([
                 this.getStateAsync(`devices.${ctx.key}.telemetry.deviceState`),
@@ -2420,6 +2495,659 @@ class Mammotion extends utils.Adapter {
 
         const refreshedSession = await this.ensureValidSession(true);
         return load(refreshedSession, true);
+    }
+
+    private async fetchLegacyProductInfo(session: AuthSession, context: DeviceContext): Promise<Record<string, any> | null> {
+        const load = async (activeSession: AuthSession, forceSessionRefresh: boolean): Promise<Record<string, any> | null> => {
+            const legacy = await this.ensureLegacySession(activeSession, forceSessionRefresh);
+            const response = await this.callLegacyApi<Record<string, any>>(
+                legacy.apiGatewayEndpoint,
+                '/living/thing/productinfo/get',
+                '1.0.2',
+                {
+                    iotId: context.iotId,
+                    ...(context.productKey ? { productKey: context.productKey } : {}),
+                    ...(context.recordDeviceName ? { deviceName: context.recordDeviceName } : {}),
+                },
+                legacy.iotToken,
+            );
+            if (response.code !== 200) {
+                throw new Error(this.extractLegacyApiMessage(response, `Legacy product info error for ${context.iotId}`));
+            }
+            if (!response.data) {
+                return null;
+            }
+            if (typeof response.data === 'string') {
+                return this.safeJsonParse<Record<string, any>>(response.data);
+            }
+            return response.data;
+        };
+
+        try {
+            return await load(session, false);
+        } catch (err) {
+            const msg = this.extractAxiosError(err).toLowerCase();
+            if (!this.isLegacySessionRetryError(msg)) {
+                throw err;
+            }
+        }
+
+        try {
+            return await load(session, true);
+        } catch (err) {
+            const msg = this.extractAxiosError(err).toLowerCase();
+            if (!this.isLegacySessionRetryError(msg)) {
+                throw err;
+            }
+        }
+
+        const refreshedSession = await this.ensureValidSession(true);
+        return load(refreshedSession, true);
+    }
+
+    private async fetchLegacyTsl(session: AuthSession, context: DeviceContext): Promise<Record<string, any> | null> {
+        const load = async (activeSession: AuthSession, forceSessionRefresh: boolean): Promise<Record<string, any> | null> => {
+            const legacy = await this.ensureLegacySession(activeSession, forceSessionRefresh);
+            const response = await this.callLegacyApi<Record<string, any>>(
+                legacy.apiGatewayEndpoint,
+                '/thing/tsl/get',
+                '1.0.2',
+                {
+                    iotId: context.iotId,
+                },
+                legacy.iotToken,
+            );
+            if (response.code !== 200) {
+                throw new Error(this.extractLegacyApiMessage(response, `Legacy TSL error for ${context.iotId}`));
+            }
+            if (!response.data) {
+                return null;
+            }
+            if (typeof response.data === 'string') {
+                return this.safeJsonParse<Record<string, any>>(response.data);
+            }
+            return response.data;
+        };
+
+        try {
+            return await load(session, false);
+        } catch (err) {
+            const msg = this.extractAxiosError(err).toLowerCase();
+            if (!this.isLegacySessionRetryError(msg)) {
+                throw err;
+            }
+        }
+
+        try {
+            return await load(session, true);
+        } catch (err) {
+            const msg = this.extractAxiosError(err).toLowerCase();
+            if (!this.isLegacySessionRetryError(msg)) {
+                throw err;
+            }
+        }
+
+        const refreshedSession = await this.ensureValidSession(true);
+        return load(refreshedSession, true);
+    }
+
+    private shouldRefreshLegacyMetadata(lastFetchByDevice: Map<string, number>, deviceKey: string, intervalMs: number): boolean {
+        const lastFetchAt = lastFetchByDevice.get(deviceKey) ?? 0;
+        return Date.now() - lastFetchAt >= intervalMs;
+    }
+
+    private scheduleLegacyMetadataRetry(lastFetchByDevice: Map<string, number>, deviceKey: string, intervalMs: number): void {
+        const retryDelayMs = Math.min(LEGACY_METADATA_RETRY_DELAY_MS, intervalMs);
+        lastFetchByDevice.set(deviceKey, Date.now() - intervalMs + retryDelayMs);
+    }
+
+    private async refreshLegacyMetadataForDevice(session: AuthSession, context: DeviceContext): Promise<void> {
+        const channelId = `devices.${context.key}`;
+        const deviceId = context.iotId;
+        if (!deviceId) {
+            return;
+        }
+
+        if (this.shouldRefreshLegacyMetadata(this.legacyProductInfoLastFetchAt, deviceId, LEGACY_PRODUCT_INFO_REFRESH_MS)) {
+            this.legacyProductInfoLastFetchAt.set(deviceId, Date.now());
+            try {
+                const productInfo = await this.fetchLegacyProductInfo(session, context);
+                if (productInfo) {
+                    await this.setStateChangedAsync(`${channelId}.telemetry.productInfoJson`, JSON.stringify(productInfo), true);
+                    const profile = productInfo.profile && typeof productInfo.profile === 'object'
+                        ? (productInfo.profile as Record<string, any>)
+                        : null;
+                    const productKeyFromInfo = profile && typeof profile.productKey === 'string' ? profile.productKey : '';
+                    const deviceNameFromInfo = profile && typeof profile.deviceName === 'string' ? profile.deviceName : '';
+                    if (!context.productKey && productKeyFromInfo) {
+                        context.productKey = productKeyFromInfo;
+                        await this.setStateChangedAsync(`${channelId}.productKey`, productKeyFromInfo, true);
+                        await this.setStateChangedAsync(
+                            `${channelId}.productKeyGroup`,
+                            resolveProductKeyGroup(productKeyFromInfo) || 'UNKNOWN',
+                            true,
+                        );
+                    }
+                    if (!context.recordDeviceName && deviceNameFromInfo) {
+                        context.recordDeviceName = deviceNameFromInfo;
+                        await this.setStateChangedAsync(`${channelId}.recordDeviceName`, deviceNameFromInfo, true);
+                        if (context.productKey) {
+                            this.mqttTopicMap.set(`${context.productKey}/${context.recordDeviceName}`, context.key);
+                        }
+                    }
+                }
+            } catch (err) {
+                this.scheduleLegacyMetadataRetry(this.legacyProductInfoLastFetchAt, deviceId, LEGACY_PRODUCT_INFO_REFRESH_MS);
+                this.log.debug(`Legacy productinfo failed for ${context.deviceName || context.iotId}: ${this.extractAxiosError(err)}`);
+            }
+        }
+
+        if (this.shouldRefreshLegacyMetadata(this.legacyTslLastFetchAt, deviceId, LEGACY_TSL_REFRESH_MS)) {
+            this.legacyTslLastFetchAt.set(deviceId, Date.now());
+            try {
+                const tsl = await this.fetchLegacyTsl(session, context);
+                if (tsl) {
+                    await this.applyLegacyTslMetadata(channelId, context, tsl);
+                }
+            } catch (err) {
+                this.scheduleLegacyMetadataRetry(this.legacyTslLastFetchAt, deviceId, LEGACY_TSL_REFRESH_MS);
+                this.log.debug(`Legacy tsl/get failed for ${context.deviceName || context.iotId}: ${this.extractAxiosError(err)}`);
+            }
+        }
+    }
+
+    private async applyLegacyTslMetadata(channelId: string, context: DeviceContext, tsl: Record<string, any>): Promise<void> {
+        await this.setStateChangedAsync(`${channelId}.telemetry.tslJson`, JSON.stringify(tsl), true);
+        const serviceCount = Array.isArray(tsl.services) ? tsl.services.length : 0;
+        const propertyCount = Array.isArray(tsl.properties) ? tsl.properties.length : 0;
+        const eventCount = Array.isArray(tsl.events) ? tsl.events.length : 0;
+        await this.setStateChangedAsync(`${channelId}.telemetry.tslServiceCount`, serviceCount, true);
+        await this.setStateChangedAsync(`${channelId}.telemetry.tslPropertyCount`, propertyCount, true);
+        await this.setStateChangedAsync(`${channelId}.telemetry.tsl.serviceCount`, serviceCount, true);
+        await this.setStateChangedAsync(`${channelId}.telemetry.tsl.propertyCount`, propertyCount, true);
+        await this.setStateChangedAsync(`${channelId}.telemetry.tsl.eventCount`, eventCount, true);
+
+        if (typeof tsl.schema === 'string') {
+            await this.setStateChangedAsync(`${channelId}.telemetry.tsl.schema`, tsl.schema, true);
+        }
+        if (typeof tsl.link === 'string') {
+            await this.setStateChangedAsync(`${channelId}.telemetry.tsl.link`, tsl.link, true);
+        }
+        if (Array.isArray(tsl.services)) {
+            await this.setStateChangedAsync(`${channelId}.telemetry.tsl.servicesJson`, JSON.stringify(tsl.services), true);
+        }
+        if (Array.isArray(tsl.events)) {
+            await this.setStateChangedAsync(`${channelId}.telemetry.tsl.eventsJson`, JSON.stringify(tsl.events), true);
+        }
+        if (Array.isArray(tsl.properties)) {
+            await this.setStateChangedAsync(`${channelId}.telemetry.tsl.propertiesJson`, JSON.stringify(tsl.properties), true);
+        }
+
+        const profile = tsl.profile && typeof tsl.profile === 'object' ? (tsl.profile as Record<string, any>) : null;
+        const profileProductKey = profile && typeof profile.productKey === 'string' ? profile.productKey : '';
+        const profileDeviceName = profile && typeof profile.deviceName === 'string' ? profile.deviceName : '';
+        if (profileProductKey) {
+            await this.setStateChangedAsync(`${channelId}.telemetry.tsl.profileProductKey`, profileProductKey, true);
+            if (!context.productKey) {
+                context.productKey = profileProductKey;
+                await this.setStateChangedAsync(`${channelId}.productKey`, profileProductKey, true);
+                await this.setStateChangedAsync(
+                    `${channelId}.productKeyGroup`,
+                    resolveProductKeyGroup(profileProductKey) || 'UNKNOWN',
+                    true,
+                );
+            }
+        }
+        if (profileDeviceName) {
+            await this.setStateChangedAsync(`${channelId}.telemetry.tsl.profileDeviceName`, profileDeviceName, true);
+            if (!context.recordDeviceName) {
+                context.recordDeviceName = profileDeviceName;
+                await this.setStateChangedAsync(`${channelId}.recordDeviceName`, profileDeviceName, true);
+            }
+        }
+
+        if (context.productKey && context.recordDeviceName) {
+            this.mqttTopicMap.set(`${context.productKey}/${context.recordDeviceName}`, context.key);
+        }
+
+        const propertyDefs = this.buildLegacyTslPropertyDefinitions(channelId, tsl);
+        await this.ensureLegacyTslPropertyStates(propertyDefs);
+        this.legacyTslPropertiesByDevice.set(
+            context.key,
+            new Map(propertyDefs.map(def => [def.identifier, def])),
+        );
+        await this.applyLegacyTslEventsTree(channelId, tsl.events);
+    }
+
+    private buildLegacyTslPropertyDefinitions(channelId: string, tsl: Record<string, any>): LegacyTslPropertyDefinition[] {
+        if (!Array.isArray(tsl.properties)) {
+            return [];
+        }
+
+        const defs: LegacyTslPropertyDefinition[] = [];
+        const usedIds = new Set<string>();
+        let idx = 0;
+        for (const entry of tsl.properties) {
+            idx += 1;
+            if (!entry || typeof entry !== 'object') {
+                continue;
+            }
+            const identifier = typeof entry.identifier === 'string' ? entry.identifier.trim() : '';
+            if (!identifier) {
+                continue;
+            }
+            const dataType = entry.dataType && typeof entry.dataType === 'object' ? (entry.dataType as Record<string, any>) : {};
+            const dataTypeKind = typeof dataType.type === 'string' ? dataType.type.toLowerCase() : 'text';
+            const specs = dataType.specs && typeof dataType.specs === 'object' ? (dataType.specs as Record<string, any>) : {};
+            const baseObjectId = this.sanitizeObjectId(identifier) || `prop_${idx}`;
+            let objectId = baseObjectId;
+            let suffix = 2;
+            while (usedIds.has(objectId)) {
+                objectId = `${baseObjectId}_${suffix}`;
+                suffix += 1;
+            }
+            usedIds.add(objectId);
+
+            let valueType: ioBroker.CommonType = 'string';
+            let role = 'text';
+            let isJson = false;
+            if (dataTypeKind === 'bool') {
+                valueType = 'boolean';
+                role = 'indicator';
+            } else if (dataTypeKind === 'int' || dataTypeKind === 'float' || dataTypeKind === 'double') {
+                valueType = 'number';
+                role = 'value';
+            } else if (dataTypeKind === 'struct' || dataTypeKind === 'array') {
+                valueType = 'string';
+                role = 'json';
+                isJson = true;
+            }
+
+            const min = this.pickNumber(specs.min);
+            const max = this.pickNumber(specs.max);
+            const step = this.pickNumber(specs.step);
+            const unitRaw = specs.unit ?? specs.unitName;
+            const unit = typeof unitRaw === 'string' && unitRaw.trim() ? unitRaw.trim() : undefined;
+            const friendlyName = typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : identifier;
+
+            defs.push({
+                identifier,
+                name: friendlyName,
+                dataType: dataTypeKind,
+                objectId,
+                stateId: `${channelId}.telemetry.dynamic.${objectId}`,
+                valueType,
+                role,
+                unit,
+                min,
+                max,
+                step,
+                isJson,
+            });
+        }
+
+        return defs;
+    }
+
+    private async ensureLegacyTslPropertyStates(defs: LegacyTslPropertyDefinition[]): Promise<void> {
+        for (const def of defs) {
+            await this.setObjectNotExistsAsync(def.stateId, {
+                type: 'state',
+                common: {
+                    name: `${def.name} (${def.identifier})`,
+                    type: def.valueType,
+                    role: def.role,
+                    read: true,
+                    write: false,
+                    unit: def.unit,
+                    min: def.min ?? undefined,
+                    max: def.max ?? undefined,
+                    step: def.step ?? undefined,
+                    expert: true,
+                },
+                native: {
+                    source: 'legacy-tsl',
+                    identifier: def.identifier,
+                    dataType: def.dataType,
+                },
+            });
+        }
+    }
+
+    private sanitizeChildObjectId(raw: string, fallback: string): string {
+        const sanitized = this.sanitizeObjectId(raw);
+        return sanitized || fallback;
+    }
+
+    private async setJsonLeafState(
+        stateId: string,
+        name: string,
+        value: string | number | boolean,
+        expert = true,
+    ): Promise<void> {
+        const valueType: ioBroker.CommonType = typeof value === 'number' ? 'number' : typeof value === 'boolean' ? 'boolean' : 'string';
+        const role =
+            valueType === 'number'
+                ? 'value'
+                : valueType === 'boolean'
+                    ? 'indicator'
+                    : 'text';
+        await this.setObjectNotExistsAsync(stateId, this.createReadonlyState(name, valueType, role, undefined, expert));
+        await this.setStateChangedAsync(stateId, value, true);
+    }
+
+    private async applyJsonTreeNode(
+        nodeId: string,
+        value: any,
+        depth: number,
+        maxDepth: number,
+        expert = true,
+    ): Promise<void> {
+        if (depth >= maxDepth || value === null || value === undefined) {
+            return;
+        }
+
+        if (Array.isArray(value)) {
+            const limit = Math.min(value.length, 20);
+            for (let idx = 0; idx < limit; idx++) {
+                const entry = value[idx];
+                const childId = `${nodeId}.i${idx}`;
+                if (entry && typeof entry === 'object') {
+                    await this.extendObjectAsync(childId, { type: 'channel', common: { name: `#${idx}` }, native: {} });
+                    await this.applyJsonTreeNode(childId, entry, depth + 1, maxDepth, expert);
+                    continue;
+                }
+                if (entry === null || entry === undefined) {
+                    continue;
+                }
+                if (typeof entry === 'string' || typeof entry === 'number' || typeof entry === 'boolean') {
+                    await this.setJsonLeafState(childId, `#${idx}`, entry, expert);
+                } else {
+                    await this.setJsonLeafState(childId, `#${idx}`, JSON.stringify(entry), expert);
+                }
+            }
+            return;
+        }
+
+        if (typeof value !== 'object') {
+            return;
+        }
+
+        const entries = Object.entries(value as Record<string, any>).slice(0, 80);
+        for (const [rawKey, rawVal] of entries) {
+            const childObjectId = this.sanitizeChildObjectId(rawKey, 'value');
+            const childId = `${nodeId}.${childObjectId}`;
+            if (rawVal && typeof rawVal === 'object') {
+                await this.extendObjectAsync(childId, { type: 'channel', common: { name: rawKey }, native: {} });
+                await this.applyJsonTreeNode(childId, rawVal, depth + 1, maxDepth, expert);
+                continue;
+            }
+            if (rawVal === null || rawVal === undefined) {
+                continue;
+            }
+            if (typeof rawVal === 'string' || typeof rawVal === 'number' || typeof rawVal === 'boolean') {
+                await this.setJsonLeafState(childId, rawKey, rawVal, expert);
+            } else {
+                await this.setJsonLeafState(childId, rawKey, JSON.stringify(rawVal), expert);
+            }
+        }
+    }
+
+    private async applyJsonTree(rootId: string, name: string, value: any, expert = true): Promise<void> {
+        await this.extendObjectAsync(rootId, { type: 'channel', common: { name }, native: {} });
+        const serialized = (() => {
+            try {
+                return JSON.stringify(value);
+            } catch {
+                return '';
+            }
+        })();
+        await this.setObjectNotExistsAsync(`${rootId}.json`, this.createReadonlyState(`${name} JSON`, 'string', 'json', undefined, expert));
+        await this.setStateChangedAsync(`${rootId}.json`, serialized, true);
+        if (!serialized) {
+            return;
+        }
+        await this.applyJsonTreeNode(rootId, value, 0, 5, expert);
+    }
+
+    private async applyLegacyTslEventsTree(channelId: string, eventsRaw: unknown): Promise<void> {
+        if (!Array.isArray(eventsRaw)) {
+            return;
+        }
+        const eventsRoot = `${channelId}.telemetry.tsl.events`;
+        await this.extendObjectAsync(eventsRoot, { type: 'channel', common: { name: 'TSL Events' }, native: {} });
+
+        for (let idx = 0; idx < eventsRaw.length; idx++) {
+            const event = eventsRaw[idx];
+            if (!event || typeof event !== 'object') {
+                continue;
+            }
+            const eventObj = event as Record<string, any>;
+            const identifier = typeof eventObj.identifier === 'string' ? eventObj.identifier.trim() : '';
+            const method = typeof eventObj.method === 'string' ? eventObj.method.trim() : '';
+            const title = typeof eventObj.name === 'string' && eventObj.name.trim() ? eventObj.name.trim() : identifier || `event_${idx + 1}`;
+            const eventObjectId = this.sanitizeChildObjectId(identifier || method || `event_${idx + 1}`, `event_${idx + 1}`);
+            const eventRoot = `${eventsRoot}.${eventObjectId}`;
+
+            await this.extendObjectAsync(eventRoot, { type: 'channel', common: { name: title }, native: {} });
+            await this.setJsonLeafState(`${eventRoot}.identifier`, 'Identifier', identifier || eventObjectId, true);
+            if (method) {
+                await this.setJsonLeafState(`${eventRoot}.method`, 'Method', method, true);
+            }
+            if (typeof eventObj.type === 'string') {
+                await this.setJsonLeafState(`${eventRoot}.type`, 'Type', eventObj.type, true);
+            }
+            if (typeof eventObj.callType === 'string') {
+                await this.setJsonLeafState(`${eventRoot}.callType`, 'Call type', eventObj.callType, true);
+            }
+            if (typeof eventObj.required === 'boolean') {
+                await this.setJsonLeafState(`${eventRoot}.required`, 'Required', eventObj.required, true);
+            }
+            if (typeof eventObj.desc === 'string' && eventObj.desc.trim()) {
+                await this.setJsonLeafState(`${eventRoot}.desc`, 'Description', eventObj.desc, true);
+            }
+
+            const outputData = Array.isArray(eventObj.outputData) ? eventObj.outputData : [];
+            await this.setJsonLeafState(`${eventRoot}.outputCount`, 'Output data count', outputData.length, true);
+            await this.setObjectNotExistsAsync(
+                `${eventRoot}.outputDataJson`,
+                this.createReadonlyState('Output data JSON', 'string', 'json', undefined, true),
+            );
+            await this.setStateChangedAsync(`${eventRoot}.outputDataJson`, JSON.stringify(outputData), true);
+
+            const outputRoot = `${eventRoot}.outputData`;
+            await this.extendObjectAsync(outputRoot, { type: 'channel', common: { name: 'Output data' }, native: {} });
+            for (let outIdx = 0; outIdx < outputData.length; outIdx++) {
+                const outputEntry = outputData[outIdx];
+                if (!outputEntry || typeof outputEntry !== 'object') {
+                    continue;
+                }
+                const outputObj = outputEntry as Record<string, any>;
+                const outputIdentifier =
+                    typeof outputObj.identifier === 'string' && outputObj.identifier.trim()
+                        ? outputObj.identifier.trim()
+                        : `field_${outIdx + 1}`;
+                const outputId = this.sanitizeChildObjectId(outputIdentifier, `field_${outIdx + 1}`);
+                const outputPath = `${outputRoot}.${outputId}`;
+                await this.extendObjectAsync(outputPath, {
+                    type: 'channel',
+                    common: { name: typeof outputObj.name === 'string' && outputObj.name.trim() ? outputObj.name.trim() : outputIdentifier },
+                    native: {},
+                });
+                await this.setJsonLeafState(`${outputPath}.identifier`, 'Identifier', outputIdentifier, true);
+                if (typeof outputObj.name === 'string' && outputObj.name.trim()) {
+                    await this.setJsonLeafState(`${outputPath}.name`, 'Name', outputObj.name.trim(), true);
+                }
+
+                const dataType = outputObj.dataType && typeof outputObj.dataType === 'object' ? (outputObj.dataType as Record<string, any>) : null;
+                if (dataType && typeof dataType.type === 'string') {
+                    await this.setJsonLeafState(`${outputPath}.type`, 'Data type', dataType.type, true);
+                }
+                const specs = dataType?.specs;
+                if (specs !== undefined) {
+                    await this.setObjectNotExistsAsync(
+                        `${outputPath}.specsJson`,
+                        this.createReadonlyState('Specs JSON', 'string', 'json', undefined, true),
+                    );
+                    await this.setStateChangedAsync(
+                        `${outputPath}.specsJson`,
+                        (() => {
+                            try {
+                                return JSON.stringify(specs);
+                            } catch {
+                                return '';
+                            }
+                        })(),
+                        true,
+                    );
+                    if (specs && typeof specs === 'object' && !Array.isArray(specs)) {
+                        const specsObj = specs as Record<string, any>;
+                        const min = this.pickNumber(specsObj.min);
+                        const max = this.pickNumber(specsObj.max);
+                        const step = this.pickNumber(specsObj.step);
+                        const unit = typeof specsObj.unit === 'string' ? specsObj.unit : typeof specsObj.unitName === 'string' ? specsObj.unitName : '';
+                        if (min !== null) await this.setJsonLeafState(`${outputPath}.min`, 'Min', min, true);
+                        if (max !== null) await this.setJsonLeafState(`${outputPath}.max`, 'Max', max, true);
+                        if (step !== null) await this.setJsonLeafState(`${outputPath}.step`, 'Step', step, true);
+                        if (unit) await this.setJsonLeafState(`${outputPath}.unit`, 'Unit', unit, true);
+                    } else if (Array.isArray(specs)) {
+                        await this.applyJsonTree(`${outputPath}.specs`, 'Specs', specs, true);
+                    }
+                }
+            }
+        }
+    }
+
+    private extractLegacyTslRawValue(
+        identifier: string,
+        params: Record<string, any> | undefined,
+        data: Record<string, any> | undefined,
+    ): any {
+        const fromParamsItems = params?.items && typeof params.items === 'object' ? (params.items as Record<string, any>)[identifier] : undefined;
+        if (fromParamsItems && typeof fromParamsItems === 'object' && 'value' in fromParamsItems) {
+            return fromParamsItems.value;
+        }
+        if (fromParamsItems !== undefined) {
+            return fromParamsItems;
+        }
+
+        const fromParams = params ? params[identifier] : undefined;
+        if (fromParams && typeof fromParams === 'object' && 'value' in fromParams) {
+            return fromParams.value;
+        }
+        if (fromParams !== undefined) {
+            return fromParams;
+        }
+
+        const fromDataItems = data?.items && typeof data.items === 'object' ? (data.items as Record<string, any>)[identifier] : undefined;
+        if (fromDataItems && typeof fromDataItems === 'object' && 'value' in fromDataItems) {
+            return fromDataItems.value;
+        }
+        if (fromDataItems !== undefined) {
+            return fromDataItems;
+        }
+
+        const fromData = data ? data[identifier] : undefined;
+        if (fromData && typeof fromData === 'object' && 'value' in fromData) {
+            return fromData.value;
+        }
+        return fromData;
+    }
+
+    private normalizeLegacyTslStateValue(def: LegacyTslPropertyDefinition, raw: any): ioBroker.StateValue | null {
+        if (raw === undefined || raw === null) {
+            return null;
+        }
+
+        if (def.valueType === 'number') {
+            const num = this.pickNumber(raw);
+            return num !== null ? num : null;
+        }
+
+        if (def.valueType === 'boolean') {
+            if (typeof raw === 'boolean') {
+                return raw;
+            }
+            if (typeof raw === 'number') {
+                return raw !== 0;
+            }
+            if (typeof raw === 'string') {
+                const normalized = raw.trim().toLowerCase();
+                if (['1', 'true', 'on', 'yes'].includes(normalized)) {
+                    return true;
+                }
+                if (['0', 'false', 'off', 'no'].includes(normalized)) {
+                    return false;
+                }
+            }
+            return null;
+        }
+
+        if (typeof raw === 'string') {
+            return raw;
+        }
+        if (typeof raw === 'number' || typeof raw === 'boolean') {
+            return String(raw);
+        }
+        try {
+            return JSON.stringify(raw);
+        } catch {
+            return null;
+        }
+    }
+
+    private async applyLegacyTslValuesFromPayload(
+        deviceKey: string,
+        channelId: string,
+        params: Record<string, any> | undefined,
+        data: Record<string, any> | undefined,
+    ): Promise<void> {
+        const defs = this.legacyTslPropertiesByDevice.get(deviceKey);
+        if (!defs || defs.size === 0) {
+            return;
+        }
+
+        const updates: Array<Promise<unknown>> = [];
+        for (const def of defs.values()) {
+            const rawValue = this.extractLegacyTslRawValue(def.identifier, params, data);
+            if (rawValue === undefined || rawValue === null) {
+                continue;
+            }
+            const normalized = this.normalizeLegacyTslStateValue(def, rawValue);
+            if (normalized === null) {
+                continue;
+            }
+            updates.push(this.setStateChangedAsync(def.stateId, normalized, true));
+
+            const rawJsonString = typeof rawValue === 'string' ? rawValue : typeof normalized === 'string' ? normalized : '';
+            if (!rawJsonString) {
+                continue;
+            }
+            const parsed = this.safeJsonParse<any>(rawJsonString);
+            if (!parsed || typeof parsed !== 'object') {
+                continue;
+            }
+            const dynamicJsonRoot = `${channelId}.telemetry.dynamicJson.${def.objectId}`;
+            const serialized = (() => {
+                try {
+                    return JSON.stringify(parsed);
+                } catch {
+                    return '';
+                }
+            })();
+            if (!serialized) {
+                continue;
+            }
+            if (this.dynamicJsonByState.get(dynamicJsonRoot) === serialized) {
+                continue;
+            }
+            this.dynamicJsonByState.set(dynamicJsonRoot, serialized);
+            updates.push(this.applyJsonTree(dynamicJsonRoot, def.name || def.identifier, parsed, true));
+        }
+        if (updates.length > 0) {
+            await Promise.all(updates);
+            await this.setStateChangedAsync(`${channelId}.telemetry.tsl.lastDynamicUpdate`, Date.now(), true);
+        }
     }
 
     private async applyLegacyTelemetry(channelId: string, properties: Record<string, any>): Promise<void> {
@@ -2529,6 +3257,7 @@ class Mammotion extends utils.Adapter {
             const taskArea = this.pickNumber(deviceOtherInfo.task_area);
             if (taskArea !== null) await this.setStateChangedAsync(`${channelId}.telemetry.taskAreaM2`, taskArea, true);
         }
+        await this.applyLegacyTslValuesFromPayload(channelId.replace(/^devices\./, ''), channelId, data, data);
     }
 
     private normalizeCoordinate(lat: number | null, lon: number | null): { lat: number | null; lon: number | null } {
@@ -3220,8 +3949,11 @@ class Mammotion extends utils.Adapter {
             this.log.debug(`[AREA-REQ] Request already in flight for ${context.deviceName || context.iotId}, skipping duplicate trigger.`);
             return false;
         }
-        if (!this.isMqttConnectedForAreaResponses()) {
-            this.log.debug(`[AREA-REQ] MQTT not connected yet for ${context.deviceName || context.iotId}, postponing request.`);
+        if (!this.aliyunMqttConnected) {
+            this.log.debug(
+                `[AREA-REQ] Aliyun MQTT not connected for ${context.deviceName || context.iotId}; postponing zone request.`,
+            );
+            await this.ensureAliyunMqttRunning('area-name-request');
             return false;
         }
 
@@ -3251,59 +3983,73 @@ class Mammotion extends utils.Adapter {
                 receivers.add(17);
                 receivers.add(1);
             }
+            const receiverList = [...receivers];
+            const round = this.areaNameRequestRound.get(context.key) ?? 0;
+            this.areaNameRequestRound.set(context.key, round + 1);
+            const receiver = receiverList[round % receiverList.length];
+            const subCmd = round % 2 === 0 ? 3 : 0;
 
-            let firstCall = true;
-            // First try sub_cmd=3 (AppGetAllAreaHashName / field 61) – gives area hashes + names directly.
-            for (const receiver of receivers) {
-                if (!firstCall) {
-                    await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
-                }
-                firstCall = false;
+            await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
+            const commandLabel = subCmd === 3 ? 'area-name-list-v3' : 'area-name-list';
+            const result = await this.executeEncodedContentCommand(
+                context,
+                commandLabel,
+                (_session, ctx) => this.buildAreaNameListContent(_session, ctx, subCmd, receiver),
+            );
+            this.log.debug(
+                `[AREA-REQ] sub_cmd=${subCmd} response (receiver=${receiver}, len=${result?.length ?? 0}): ${result?.substring(0, 100)}`,
+            );
 
-                this.log.debug(
-                    `[AREA-REQ] Sending sub_cmd=3 (AppGetAllAreaHashName) for ${context.deviceName || context.iotId}, receiver=${receiver}`,
-                );
-                const result3 = await this.executeEncodedContentCommand(context, 'area-name-list-v3', (_session, ctx) =>
-                    this.buildAreaNameListContent(_session, ctx, 3, receiver),
-                );
-                this.log.debug(
-                    `[AREA-REQ] sub_cmd=3 response (receiver=${receiver}, len=${result3?.length ?? 0}): ${result3?.substring(0, 100)}`,
-                );
-                if (result3 && result3 !== 'ok' && result3.length > 20) {
-                    const areas = this.tryParseAreaHashNames(result3);
-                    if (areas && areas.length > 0) {
-                        this.rememberAreaNames(context.key, areas);
-                        this.log.debug(`[AREA-REQ] Names cached via sub_cmd=3: ${areas.length}`);
-                    }
-                }
+            if (!result || result === 'ok' || result.length <= 20) {
+                return true;
             }
 
-            // sub_cmd=0: device responds with NavGetHashListAck (field 31) → triggers field-32 classification
-            for (const receiver of receivers) {
-                await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
-                const result0 = await this.executeEncodedContentCommand(context, 'area-name-list', (_session, ctx) =>
-                    this.buildAreaNameListContent(_session, ctx, 0, receiver),
+            const directAreas = this.tryParseAreaHashNames(result);
+            if (directAreas && directAreas.length > 0) {
+                this.rememberAreaNames(context.key, directAreas);
+                this.classifiedAreaHashesByDevice.set(
+                    context.key,
+                    new Set(directAreas.map(area => area.hash.toString())),
                 );
-                this.log.debug(
-                    `[AREA-REQ] sub_cmd=0 response (receiver=${receiver}, len=${result0?.length ?? 0}): ${result0?.substring(0, 100)}`,
+                this.lastRequestedHashSetByDevice.set(
+                    context.key,
+                    directAreas.map(area => area.hash.toString()).join(','),
                 );
-                if (result0 && result0 !== 'ok' && result0.length > 20) {
-                    const areas = this.tryParseAreaHashNames(result0);
-                    if (areas && areas.length > 0) {
-                        this.rememberAreaNames(context.key, areas);
-                        this.log.debug(`[AREA-REQ] Names cached via sub_cmd=0: ${areas.length}`);
-                    }
-                }
+                await this.updateZoneStates(context.key, directAreas);
+                this.areaNameRateLimitHits.delete(context.key);
+                return true;
             }
+
+            const hashIds = this.tryParseNavGetHashListAck(result, context.key);
+            if (hashIds && hashIds.length > 0) {
+                await this.requestAreaNamesForHashes(context, hashIds);
+            }
+
+            this.areaNameRateLimitHits.delete(context.key);
             return true;
         } catch (err) {
             if (this.isRateLimitError(err)) {
-                this.areaNameCooldownUntil.set(context.key, Date.now() + AREA_NAME_RATE_LIMIT_COOLDOWN_MS);
+                const hits = (this.areaNameRateLimitHits.get(context.key) ?? 0) + 1;
+                this.areaNameRateLimitHits.set(context.key, hits);
+                const backoffMultiplier = Math.min(2 ** (hits - 1), 30);
+                const cooldownMs = Math.min(AREA_NAME_RATE_LIMIT_COOLDOWN_MS * backoffMultiplier, AREA_NAME_RATE_LIMIT_COOLDOWN_MAX_MS);
+                this.areaNameCooldownUntil.set(context.key, Date.now() + cooldownMs);
+                const axiosErr = err as AxiosError;
+                const rateBodyRaw = axiosErr?.response?.data;
+                const rateBody =
+                    typeof rateBodyRaw === 'string'
+                        ? rateBodyRaw
+                        : rateBodyRaw
+                            ? JSON.stringify(rateBodyRaw)
+                            : '';
                 this.log.warn(
                     `[AREA-REQ] Rate limit hit for ${context.deviceName || context.iotId}. Backing off for ${
-                        AREA_NAME_RATE_LIMIT_COOLDOWN_MS / 1000
+                        Math.ceil(cooldownMs / 1000)
                     }s.`,
                 );
+                if (rateBody) {
+                    this.log.debug(`[AREA-REQ] 429 response body: ${rateBody.substring(0, 500)}`);
+                }
             }
             throw err;
         } finally {
@@ -3520,8 +4266,10 @@ class Mammotion extends utils.Adapter {
             });
 
             // Send field-32 request; aso check sync HTTP response immediately
-            void this.executeEncodedContentCommand(context, 'get-comm-data', (_s, ctx) =>
-                this.buildNavGetCommDataContent(_s, ctx, hash),
+            void this.executeEncodedContentCommand(
+                context,
+                'get-comm-data',
+                (_s, ctx) => this.buildNavGetCommDataContent(_s, ctx, hash),
             ).then(result => {
                 if (result && result !== 'ok' && result.length > 20) {
                     this.resolveCommDataAck(context.key, result);
@@ -3614,13 +4362,24 @@ class Mammotion extends utils.Adapter {
 
     private async requestAreaNamesForAllDevices(): Promise<void> {
         for (const ctx of this.deviceContexts.values()) {
+            if (await this.hasKnownAreas(ctx.key)) {
+                this.clearAreaNameRetry(ctx.key);
+                continue;
+            }
             try {
                 const requestSent = await this.sendAreaNameListRequest(ctx);
                 if (requestSent) {
                     this.startAreaNameRetry(ctx.key);
+                } else if (!(await this.hasKnownAreas(ctx.key))) {
+                    this.startAreaNameRetry(ctx.key);
                 }
             } catch (err) {
                 this.log.debug(`Area-name request failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
+                if (this.isRateLimitError(err)) {
+                    this.scheduleAreaNameRetryFromCooldown(ctx.key);
+                } else {
+                    this.startAreaNameRetry(ctx.key);
+                }
             }
             await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
         }
@@ -3636,11 +4395,18 @@ class Mammotion extends utils.Adapter {
                 const requestSent = await this.sendAreaNameListRequest(ctx);
                 if (requestSent) {
                     this.startAreaNameRetry(ctx.key);
+                } else if (!(await this.hasKnownAreas(ctx.key))) {
+                    this.startAreaNameRetry(ctx.key);
                 }
             } catch (err) {
                 this.log.debug(
                     `Area-Name-Re-Request (missing) failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`,
                 );
+                if (this.isRateLimitError(err)) {
+                    this.scheduleAreaNameRetryFromCooldown(ctx.key);
+                } else {
+                    this.startAreaNameRetry(ctx.key);
+                }
             }
             await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
         }
@@ -3665,6 +4431,25 @@ class Mammotion extends utils.Adapter {
             .finally(() => {
                 this.areaNameMissingRequestInFlight = false;
             });
+    }
+
+    private async sleepMs(ms: number): Promise<void> {
+        if (ms <= 0) {
+            return;
+        }
+        await new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    private isMqttConnectedForAreaResponses(): boolean {
+        return this.jwtMqttConnected || this.aliyunMqttConnected;
+    }
+
+    private isRateLimitError(err: unknown): boolean {
+        if (axios.isAxiosError(err) && err.response?.status === 429) {
+            return true;
+        }
+        const msg = this.extractAxiosError(err).toLowerCase();
+        return msg.includes('status code 429') || msg.includes('too many requests') || msg.includes('rate limit');
     }
 
     private async callAepHandle(session: LegacySession): Promise<AliyunMqttCreds> {
@@ -3768,6 +4553,7 @@ class Mammotion extends utils.Adapter {
                 `${aepBase}/app/down/thing/model/down_raw`,
                 `${aepBase}/app/down/_thing/event/notify`,
                 `${aepBase}/app/down/thing/event/property/post_reply`,
+                `${aepBase}/app/down/thing/service/invoke/reply`,
             ];
             for (const topic of aepTopics) {
                 client.subscribe(topic, { qos: 1 }, (err: Error | null) => {
@@ -3779,14 +4565,25 @@ class Mammotion extends utils.Adapter {
                 });
             }
 
-            // Re-request area names now that MQTT is connected and can receive the async response
-            setTimeout(() => {
-                this.triggerAreaNameMissingRequest('aliyun-connect');
-            }, 2_000);
+            // Area-name requests are handled by startup/manual retry flow. Avoid reconnect-triggered
+            // request bursts here because unstable MQTT sessions can otherwise amplify API throttling.
+            this.triggerAreaNameMissingRequest('aliyun-connect');
         });
 
         client.on('message', (topic: string, payload: Buffer) => {
             void this.handleMqttMessage(topic, payload);
+        });
+
+        client.on('packetreceive', (packet: any) => {
+            if (packet?.cmd !== 'connack') {
+                return;
+            }
+            const code = packet.reasonCode ?? packet.returnCode ?? packet.code ?? 'n/a';
+            this.log.debug(`[ALIYUN-MQTT] connack received (code=${code}, sessionPresent=${packet.sessionPresent ?? false})`);
+        });
+
+        client.on('reconnect', () => {
+            this.log.debug('Aliyun MQTT reconnecting');
         });
 
         client.on('error', (err: Error) => {
@@ -3827,12 +4624,12 @@ class Mammotion extends utils.Adapter {
         try {
             const requestSent = await this.sendAreaNameListRequest(ctx);
             if (requestSent) {
-                this.startAreaNameRetry(deviceKey);
-                this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
-            } else {
-                this.log.info(`Area-name request deferred for ${ctx.deviceName || ctx.iotId} (MQTT/cooldown/in-flight).`);
+                this.startAreaNameRetry(ctx.key);
+            } else if (!(await this.hasKnownAreas(ctx.key))) {
+                this.startAreaNameRetry(ctx.key);
             }
             await this.setStateChangedAsync(localId, false, true);
+            this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
@@ -4043,7 +4840,6 @@ class Mammotion extends utils.Adapter {
 
     private async updateZoneStates(deviceKey: string, areas: Array<{ name: string; hash: bigint }>): Promise<void> {
         const channelId = `devices.${deviceKey}`;
-        this.clearAreaNameRetry(deviceKey);
 
         const areasJson = JSON.stringify(areas.map(a => ({ name: a.name, hash: a.hash.toString() })));
         await this.setStateChangedAsync(`${channelId}.telemetry.areasJson`, areasJson, true);
@@ -4083,6 +4879,7 @@ class Mammotion extends utils.Adapter {
         }
 
         await this.cleanupObsoleteZones(deviceKey, new Set(areas.map(area => this.sanitizeObjectId(area.name))));
+        this.areaNameRequestRound.delete(deviceKey);
         this.log.debug(`${deviceKey}: ${areas.length} zone(s) updated.`);
     }
 
@@ -4164,6 +4961,14 @@ class Mammotion extends utils.Adapter {
         this.areaNameRetryAttempts.delete(deviceKey);
     }
 
+    private scheduleAreaNameRetryFromCooldown(deviceKey: string): void {
+        const cooldownUntil = this.areaNameCooldownUntil.get(deviceKey) ?? 0;
+        const cooldownRemainingMs = Math.max(0, cooldownUntil - Date.now());
+        this.clearAreaNameRetry(deviceKey);
+        this.areaNameRetryAttempts.set(deviceKey, 0);
+        this.scheduleAreaNameRetryAfter(deviceKey, Math.max(cooldownRemainingMs + 2_000, AREA_NAME_REQUEST_MIN_INTERVAL_MS));
+    }
+
     private startAreaNameRetry(deviceKey: string): void {
         this.clearAreaNameRetry(deviceKey);
         this.areaNameRetryAttempts.set(deviceKey, 0);
@@ -4171,12 +4976,16 @@ class Mammotion extends utils.Adapter {
     }
 
     private scheduleAreaNameRetry(deviceKey: string): void {
+        this.scheduleAreaNameRetryAfter(deviceKey, undefined);
+    }
+
+    private scheduleAreaNameRetryAfter(deviceKey: string, delayOverrideMs?: number): void {
         const attempt = this.areaNameRetryAttempts.get(deviceKey) ?? 0;
         if (attempt >= AREA_NAME_RETRY_DELAYS_MS.length) {
             this.clearAreaNameRetry(deviceKey);
             return;
         }
-        const delay = AREA_NAME_RETRY_DELAYS_MS[attempt];
+        const delay = Math.max(1_000, Math.trunc(delayOverrideMs ?? AREA_NAME_RETRY_DELAYS_MS[attempt]));
         const timer = setTimeout(() => {
             void this.runAreaNameRetry(deviceKey);
         }, delay);
@@ -4188,11 +4997,6 @@ class Mammotion extends utils.Adapter {
         this.areaNameRetryTimers.delete(deviceKey);
         if (await this.hasKnownAreas(deviceKey)) {
             this.clearAreaNameRetry(deviceKey);
-            return;
-        }
-        if (!this.isMqttConnectedForAreaResponses()) {
-            this.log.debug(`[AREA-REQ] Retry postponed for ${deviceKey}: MQTT not connected yet.`);
-            this.scheduleAreaNameRetry(deviceKey);
             return;
         }
 
@@ -4207,11 +5011,21 @@ class Mammotion extends utils.Adapter {
         try {
             const requestSent = await this.sendAreaNameListRequest(ctx);
             if (!requestSent) {
-                this.scheduleAreaNameRetry(deviceKey);
+                const cooldownUntil = this.areaNameCooldownUntil.get(deviceKey) ?? 0;
+                const cooldownRemainingMs = cooldownUntil - Date.now();
+                if (cooldownRemainingMs > 0) {
+                    this.scheduleAreaNameRetryAfter(deviceKey, cooldownRemainingMs + 2_000);
+                } else {
+                    this.scheduleAreaNameRetry(deviceKey);
+                }
                 return;
             }
         } catch (err) {
             this.log.debug(`[AREA-REQ] retry failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
+            if (this.isRateLimitError(err)) {
+                this.scheduleAreaNameRetryFromCooldown(deviceKey);
+                return;
+            }
         }
 
         if (await this.hasKnownAreas(deviceKey)) {
@@ -4219,25 +5033,6 @@ class Mammotion extends utils.Adapter {
             return;
         }
         this.scheduleAreaNameRetry(deviceKey);
-    }
-
-    private async sleepMs(ms: number): Promise<void> {
-        if (ms <= 0) {
-            return;
-        }
-        await new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    private isMqttConnectedForAreaResponses(): boolean {
-        return this.jwtMqttConnected || this.aliyunMqttConnected;
-    }
-
-    private isRateLimitError(err: unknown): boolean {
-        if (axios.isAxiosError(err) && err.response?.status === 429) {
-            return true;
-        }
-        const msg = this.extractAxiosError(err).toLowerCase();
-        return msg.includes('status code 429') || msg.includes('too many requests') || msg.includes('rate limit');
     }
 
     private async collectOrderedZoneHashes(
@@ -4879,6 +5674,66 @@ class Mammotion extends utils.Adapter {
         await this.setObjectNotExistsAsync(`${channelId}.telemetry.totalWorkTimeSec`, this.createReadonlyState('Total work time (seconds)', 'number', 'value.interval'));
         await this.setObjectNotExistsAsync(`${channelId}.telemetry.totalMileageM`, this.createReadonlyState('Total mileage (meters)', 'number', 'value.distance'));
         await this.setObjectNotExistsAsync(`${channelId}.telemetry.taskAreaM2`, this.createReadonlyState('Current task area (m²)', 'number', 'value'));
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.productInfoJson`,
+            this.createReadonlyState('Legacy product info payload (debug)', 'string', 'json', undefined, true),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tslJson`,
+            this.createReadonlyState('Legacy TSL payload (debug)', 'string', 'json', undefined, true),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tslServiceCount`,
+            this.createReadonlyState('TSL service count', 'number', 'value'),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tslPropertyCount`,
+            this.createReadonlyState('TSL property count', 'number', 'value'),
+        );
+        await this.extendObjectAsync(`${channelId}.telemetry.tsl`, { type: 'channel', common: { name: 'TSL' }, native: {} });
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.schema`,
+            this.createReadonlyState('TSL schema URL', 'string', 'text'),
+        );
+        await this.setObjectNotExistsAsync(`${channelId}.telemetry.tsl.link`, this.createReadonlyState('TSL link', 'string', 'text'));
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.profileProductKey`,
+            this.createReadonlyState('TSL profile product key', 'string', 'text'),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.profileDeviceName`,
+            this.createReadonlyState('TSL profile device name', 'string', 'text'),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.serviceCount`,
+            this.createReadonlyState('TSL service count', 'number', 'value'),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.propertyCount`,
+            this.createReadonlyState('TSL property count', 'number', 'value'),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.eventCount`,
+            this.createReadonlyState('TSL event count', 'number', 'value'),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.lastDynamicUpdate`,
+            this.createReadonlyState('TSL dynamic telemetry last update', 'number', 'value.time'),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.servicesJson`,
+            this.createReadonlyState('TSL services JSON (debug)', 'string', 'json', undefined, true),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.eventsJson`,
+            this.createReadonlyState('TSL events JSON (debug)', 'string', 'json', undefined, true),
+        );
+        await this.setObjectNotExistsAsync(
+            `${channelId}.telemetry.tsl.propertiesJson`,
+            this.createReadonlyState('TSL properties JSON (debug)', 'string', 'json', undefined, true),
+        );
+        await this.extendObjectAsync(`${channelId}.telemetry.dynamic`, { type: 'channel', common: { name: 'Dynamic TSL Properties' }, native: {} });
+        await this.extendObjectAsync(`${channelId}.telemetry.dynamicJson`, { type: 'channel', common: { name: 'Dynamic JSON Trees' }, native: {} });
 
         await this.extendObjectAsync(`${channelId}.commands`, { type: 'channel', common: { name: 'Commands' }, native: {} });
         await this.setObjectNotExistsAsync(`${channelId}.commands.start`, this.createCommandState('Start mowing'));
@@ -5808,6 +6663,21 @@ interface LegacyInvokeData {
     messageId?: string;
     output?: { content?: string };
     content?: string;
+}
+
+interface LegacyTslPropertyDefinition {
+    identifier: string;
+    name: string;
+    dataType: string;
+    objectId: string;
+    stateId: string;
+    valueType: ioBroker.CommonType;
+    role: string;
+    unit?: string;
+    min: number | null;
+    max: number | null;
+    step: number | null;
+    isJson: boolean;
 }
 
 interface AliyunMqttCreds {
