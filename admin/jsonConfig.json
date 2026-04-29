@@ -5,7 +5,6 @@
         "email": {
             "type": "text",
             "label": "email",
-            "hint": "emailHint",
             "newLine": true,
             "xs": 12,
             "sm": 12,
@@ -26,7 +25,6 @@
         "deviceUuid": {
             "type": "text",
             "label": "deviceUuid",
-            "hint": "deviceUuidHint",
             "newLine": true,
             "xs": 12,
             "sm": 12,
@@ -37,7 +35,6 @@
         "legacyPollIntervalSec": {
             "type": "number",
             "label": "legacyPollIntervalSec",
-            "hint": "legacyPollIntervalSecHint",
             "newLine": true,
             "min": 10,
             "max": 300,
@@ -51,7 +48,6 @@
         "legacyTelemetryTransport": {
             "type": "select",
             "label": "legacyTelemetryTransport",
-            "hint": "legacyTelemetryTransportHint",
             "newLine": true,
             "options": [
                 {
@@ -72,7 +68,6 @@
         "storeDebugPayloads": {
             "type": "checkbox",
             "label": "storeDebugPayloads",
-            "hint": "storeDebugPayloadsHint",
             "newLine": true,
             "xs": 12,
             "sm": 12,

@@ -7,6 +7,8 @@ updates:
       interval: monthly
       time: "02:00"
       timezone: Europe/Berlin
+    cooldown:
+      default: 7
     open-pull-requests-limit: 15
     assignees:
       - DNAngelX
@@ -18,6 +20,8 @@ updates:
       interval: monthly
       time: "02:00"
       timezone: Europe/Berlin
+    cooldown:
+      default: 7
     open-pull-requests-limit: 15
     assignees:
       - DNAngelX
