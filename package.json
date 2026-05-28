@@ -77,5 +77,13 @@
   "bugs": {
     "url": "https://github.com/DNAngelX/ioBroker.mammotion/issues"
   },
+  "overrides": {
+    "@iobroker/dev-server": {
+      "yargs": "17.7.2"
+    },
+    "@iobroker/adapter-dev": {
+      "yargs": "17.7.2"
+    }
+  },
   "readmeFilename": "README.md"
 }
