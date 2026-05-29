@@ -18,15 +18,18 @@ var __copyProps = (to, from, except, desc) => {
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 var product_keys_exports = {};
 __export(product_keys_exports, {
+  ALIYUN_PRODUCT_KEYS: () => ALIYUN_PRODUCT_KEYS,
   LUBA_PRO_PRODUCT_KEYS: () => LUBA_PRO_PRODUCT_KEYS,
+  NAVIGATION_RECEIVER_PRODUCT_KEYS: () => NAVIGATION_RECEIVER_PRODUCT_KEYS,
   PRODUCT_KEY_GROUPS: () => PRODUCT_KEY_GROUPS,
   YUKA_MINI_PRODUCT_KEYS: () => YUKA_MINI_PRODUCT_KEYS,
   YUKA_ML_PRODUCT_KEYS: () => YUKA_ML_PRODUCT_KEYS,
   YUKA_PRODUCT_KEYS: () => YUKA_PRODUCT_KEYS,
+  isAliyunProductKey: () => isAliyunProductKey,
   resolveProductKeyGroup: () => resolveProductKeyGroup
 });
 module.exports = __toCommonJS(product_keys_exports);
-var _a, _b, _c, _d, _e, _f, _g, _h, _i;
+var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _A, _B, _C, _D, _E, _F, _G, _H, _I, _J, _K;
 const PRODUCT_KEY_GROUPS = {
   Cm900ProductKey: ["zkRuTK9KsXG", "6DbgVh2Qs5m"],
   Luba2MiniProductKey: ["a1L5ZfJIxGl", "a1dCWYFLROK"],
@@ -59,23 +62,63 @@ function resolveProductKeyGroup(productKey) {
   return null;
 }
 const LUBA_PRO_PRODUCT_KEYS = new Set((_a = PRODUCT_KEY_GROUPS.LubaVProProductKey) != null ? _a : []);
-const YUKA_MINI_PRODUCT_KEYS = new Set((_b = PRODUCT_KEY_GROUPS.YukaMiniProductKey) != null ? _b : []);
-const YUKA_ML_PRODUCT_KEYS = new Set((_c = PRODUCT_KEY_GROUPS.YukaMLProductKey) != null ? _c : []);
-const YUKA_PRODUCT_KEYS = /* @__PURE__ */ new Set([
-  ...(_d = PRODUCT_KEY_GROUPS.YukaProductKey) != null ? _d : [],
-  ...(_e = PRODUCT_KEY_GROUPS.YukaPlusProductKey) != null ? _e : [],
-  ...(_f = PRODUCT_KEY_GROUPS.YukaMVProductKey) != null ? _f : [],
-  ...(_g = PRODUCT_KEY_GROUPS.YukaMN100ProductKey) != null ? _g : [],
-  ...(_h = PRODUCT_KEY_GROUPS.YukaMiniProductKey) != null ? _h : [],
-  ...(_i = PRODUCT_KEY_GROUPS.YukaMLProductKey) != null ? _i : []
+const NAVIGATION_RECEIVER_PRODUCT_KEYS = /* @__PURE__ */ new Set([
+  ...(_b = PRODUCT_KEY_GROUPS.LubaVProductKey) != null ? _b : [],
+  ...(_c = PRODUCT_KEY_GROUPS.LubaVProProductKey) != null ? _c : [],
+  ...(_d = PRODUCT_KEY_GROUPS.Luba2MiniProductKey) != null ? _d : [],
+  ...(_e = PRODUCT_KEY_GROUPS.YukaProductKey) != null ? _e : [],
+  ...(_f = PRODUCT_KEY_GROUPS.YukaPlusProductKey) != null ? _f : [],
+  ...(_g = PRODUCT_KEY_GROUPS.YukaMiniProductKey) != null ? _g : [],
+  ...(_h = PRODUCT_KEY_GROUPS.YukaMVProductKey) != null ? _h : [],
+  ...(_i = PRODUCT_KEY_GROUPS.YukaMN100ProductKey) != null ? _i : [],
+  ...(_j = PRODUCT_KEY_GROUPS.YukaMLProductKey) != null ? _j : [],
+  ...(_k = PRODUCT_KEY_GROUPS.LubaLAProductKey) != null ? _k : [],
+  ...(_l = PRODUCT_KEY_GROUPS.LubaLDProductKey) != null ? _l : [],
+  ...(_m = PRODUCT_KEY_GROUPS.LubaVAProductKey) != null ? _m : [],
+  ...(_n = PRODUCT_KEY_GROUPS.LubaMDProductKey) != null ? _n : [],
+  ...(_o = PRODUCT_KEY_GROUPS.LubaMBProductKey) != null ? _o : []
 ]);
+const YUKA_MINI_PRODUCT_KEYS = new Set((_p = PRODUCT_KEY_GROUPS.YukaMiniProductKey) != null ? _p : []);
+const YUKA_ML_PRODUCT_KEYS = new Set((_q = PRODUCT_KEY_GROUPS.YukaMLProductKey) != null ? _q : []);
+const YUKA_PRODUCT_KEYS = /* @__PURE__ */ new Set([
+  ...(_r = PRODUCT_KEY_GROUPS.YukaProductKey) != null ? _r : [],
+  ...(_s = PRODUCT_KEY_GROUPS.YukaPlusProductKey) != null ? _s : [],
+  ...(_t = PRODUCT_KEY_GROUPS.YukaMVProductKey) != null ? _t : [],
+  ...(_u = PRODUCT_KEY_GROUPS.YukaMN100ProductKey) != null ? _u : [],
+  ...(_v = PRODUCT_KEY_GROUPS.YukaMiniProductKey) != null ? _v : [],
+  ...(_w = PRODUCT_KEY_GROUPS.YukaMLProductKey) != null ? _w : []
+]);
+const ALIYUN_PRODUCT_KEYS = /* @__PURE__ */ new Set([
+  ...(_x = PRODUCT_KEY_GROUPS.LubaProductKey) != null ? _x : [],
+  ...(_y = PRODUCT_KEY_GROUPS.LubaVProductKey) != null ? _y : [],
+  ...(_z = PRODUCT_KEY_GROUPS.LubaVProProductKey) != null ? _z : [],
+  ...(_A = PRODUCT_KEY_GROUPS.Luba2MiniProductKey) != null ? _A : [],
+  ...(_B = PRODUCT_KEY_GROUPS.YukaProductKey) != null ? _B : [],
+  ...(_C = PRODUCT_KEY_GROUPS.YukaPlusProductKey) != null ? _C : [],
+  ...(_D = PRODUCT_KEY_GROUPS.YukaMiniProductKey) != null ? _D : [],
+  ...(_E = PRODUCT_KEY_GROUPS.RTKProductKey) != null ? _E : [],
+  "a1jFe8HzcDb",
+  "a16cz0iXgUJ",
+  ...(_F = PRODUCT_KEY_GROUPS.LubaLDProductKey) != null ? _F : [],
+  ...(_G = PRODUCT_KEY_GROUPS.LubaVAProductKey) != null ? _G : [],
+  ...(_H = PRODUCT_KEY_GROUPS.YukaMLProductKey) != null ? _H : [],
+  ...(_I = PRODUCT_KEY_GROUPS.LubaMDProductKey) != null ? _I : [],
+  ...(_J = PRODUCT_KEY_GROUPS.LubaMBProductKey) != null ? _J : [],
+  ...(_K = PRODUCT_KEY_GROUPS.RTKNBProductKey) != null ? _K : []
+]);
+function isAliyunProductKey(productKey) {
+  return !!productKey && ALIYUN_PRODUCT_KEYS.has(productKey);
+}
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
+  ALIYUN_PRODUCT_KEYS,
   LUBA_PRO_PRODUCT_KEYS,
+  NAVIGATION_RECEIVER_PRODUCT_KEYS,
   PRODUCT_KEY_GROUPS,
   YUKA_MINI_PRODUCT_KEYS,
   YUKA_ML_PRODUCT_KEYS,
   YUKA_PRODUCT_KEYS,
+  isAliyunProductKey,
   resolveProductKeyGroup
 });
 //# sourceMappingURL=product-keys.js.map

@@ -37,6 +37,22 @@ export function resolveProductKeyGroup(productKey: string): string | null {
 }
 
 export const LUBA_PRO_PRODUCT_KEYS = new Set<string>(PRODUCT_KEY_GROUPS.LubaVProProductKey ?? []);
+export const NAVIGATION_RECEIVER_PRODUCT_KEYS = new Set<string>([
+    ...(PRODUCT_KEY_GROUPS.LubaVProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaVProProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.Luba2MiniProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaPlusProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaMiniProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaMVProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaMN100ProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaMLProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaLAProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaLDProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaVAProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaMDProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaMBProductKey ?? []),
+]);
 export const YUKA_MINI_PRODUCT_KEYS = new Set<string>(PRODUCT_KEY_GROUPS.YukaMiniProductKey ?? []);
 export const YUKA_ML_PRODUCT_KEYS = new Set<string>(PRODUCT_KEY_GROUPS.YukaMLProductKey ?? []);
 export const YUKA_PRODUCT_KEYS = new Set<string>([
@@ -47,3 +63,28 @@ export const YUKA_PRODUCT_KEYS = new Set<string>([
     ...(PRODUCT_KEY_GROUPS.YukaMiniProductKey ?? []),
     ...(PRODUCT_KEY_GROUPS.YukaMLProductKey ?? []),
 ]);
+
+// Mirrors PyMammotion's closed Aliyun product-key list. Unknown keys are
+// treated as Mammotion-IoT devices.
+export const ALIYUN_PRODUCT_KEYS = new Set<string>([
+    ...(PRODUCT_KEY_GROUPS.LubaProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaVProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaVProProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.Luba2MiniProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaPlusProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaMiniProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.RTKProductKey ?? []),
+    'a1jFe8HzcDb',
+    'a16cz0iXgUJ',
+    ...(PRODUCT_KEY_GROUPS.LubaLDProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaVAProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.YukaMLProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaMDProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.LubaMBProductKey ?? []),
+    ...(PRODUCT_KEY_GROUPS.RTKNBProductKey ?? []),
+]);
+
+export function isAliyunProductKey(productKey: string): boolean {
+    return !!productKey && ALIYUN_PRODUCT_KEYS.has(productKey);
+}
