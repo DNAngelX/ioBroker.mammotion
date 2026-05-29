@@ -144,8 +144,16 @@ const JWT_MQTT_FAST_FAIL_WINDOW_MS = 15_000;
 const JWT_MQTT_FAST_FAIL_THRESHOLD = 3;
 const JWT_MQTT_RECOVER_COOLDOWN_MS = 2 * 60 * 1000;
 const JWT_MQTT_SUPPRESS_AFTER_FLAP_MS = 30 * 60 * 1000;
+const JWT_MQTT_RECONNECT_MIN_MS = 5_000;
+const JWT_MQTT_RECONNECT_MAX_MS = 120_000;
 const INVOKE_RATE_LIMIT_BACKOFF_INITIAL_MS = 60_000;
 const INVOKE_RATE_LIMIT_BACKOFF_MAX_MS = 30 * 60 * 1000;
+const INVOKE_SERIAL_MIN_GAP_MS = 1_500;
+const AREA_INVOKE_GLOBAL_MIN_GAP_MS = 4_000;
+const AREA_NAME_MAP_NAME_SETTLE_MS = 2_500;
+const AREA_NAME_SIGNAL_POLL_MS = 200;
+const AREA_NAME_OFFLINE_RETRY_MS = 60_000;
+type InvokeRateLimitScope = 'command' | 'area' | 'sync' | 'internal';
 
 class Mammotion extends utils.Adapter {
     private mqttClient: any = null;
@@ -193,20 +201,30 @@ class Mammotion extends utils.Adapter {
     private areaNameRequestRound = new Map<string, number>();
     private areaNameCooldownUntil = new Map<string, number>();
     private areaNameRateLimitHits = new Map<string, number>();
+    private areaNameAwaitOnline = new Set<string>();
     private areaNameMissingRequestInFlight = false;
     private lastAreaNameMissingRequestAt = 0;
+    private cloudOfflineByDevice = new Map<string, boolean>();
     private invokeRateLimitedUntilByDevice = new Map<string, number>();
     private invokeRateLimitBackoffMsByDevice = new Map<string, number>();
+    private invokeQueueByDevice = new Map<string, Promise<void>>();
+    private invokeLastFinishedAtByDevice = new Map<string, number>();
+    private areaInvokeGlobalQueue: Promise<void> = Promise.resolve();
+    private areaInvokeLastFinishedAt = 0;
     private jwtMqttConnectedAt = 0;
     private jwtMqttFastFailCount = 0;
     private jwtMqttRecoverInFlight = false;
     private jwtMqttLastRecoverAt = 0;
     private jwtMqttSuppressedUntil = 0;
     private jwtMqttLastDisconnectAt = 0;
+    private jwtMqttReconnectBackoffMs = JWT_MQTT_RECONNECT_MIN_MS;
+    private jwtMqttLastAuthErrorAt = 0;
     /** Accumulator for multi-frame NavGetHashListAck messages, keyed by deviceKey. */
     private hashFrameAccumulator = new Map<string, { totalFrame: number; frames: Map<number, bigint[]> }>();
     /** Prevents duplicate gethash acks for already seen frames (device may retransmit stale frames). */
     private hashFrameAcked = new Map<string, Set<string>>();
+    /** True when the latest hash list ack for a device used hash_len (area-only root list). */
+    private hashListAreaOnlyByDevice = new Map<string, boolean>();
     /** Promise resolvers waiting for a specific field-33 response, keyed by "deviceKey:hash". */
     private classifyWaiters = new Map<string, (type: number) => void>();
 
@@ -218,6 +236,101 @@ class Mammotion extends utils.Adapter {
         this.on('ready', this.onReady.bind(this));
         this.on('stateChange', this.onStateChange.bind(this));
         this.on('unload', this.onUnload.bind(this));
+    }
+
+    private getInvokeRateLimitKey(deviceKey: string, scope: InvokeRateLimitScope): string {
+        if (scope === 'area') {
+            return '__global:area';
+        }
+        return `${deviceKey}:${scope}`;
+    }
+
+    private getInvokeScopeLabel(scope: InvokeRateLimitScope): string {
+        if (scope === 'area') {
+            return 'area request';
+        }
+        if (scope === 'sync') {
+            return 'sync request';
+        }
+        return 'command invoke';
+    }
+
+    private getInvokeScopeLogPrefix(scope: InvokeRateLimitScope): string {
+        if (scope === 'area') {
+            return 'AREA-REQ';
+        }
+        if (scope === 'sync') {
+            return 'SYNC';
+        }
+        return 'CMD';
+    }
+
+    private getInvokeRateLimitRemainingMs(context: DeviceContext, scope: InvokeRateLimitScope): number {
+        const rateLimitKey = this.getInvokeRateLimitKey(context.key, scope);
+        const until = this.invokeRateLimitedUntilByDevice.get(rateLimitKey) ?? 0;
+        return Math.max(0, until - Date.now());
+    }
+
+    private createInvokeRateLimitGateError(scopeLabel: string, remainingMs: number): Error {
+        const err = new Error(`Cloud ${scopeLabel} is rate-limited. Retry in ${Math.ceil(remainingMs / 1000)}s.`);
+        (err as Error & { code?: string; retryAfterMs?: number }).code = 'INVOKE_RATE_LIMIT_GATE';
+        (err as Error & { code?: string; retryAfterMs?: number }).retryAfterMs = remainingMs;
+        return err;
+    }
+
+    private isInvokeRateLimitGateError(err: unknown): err is Error & { code: string; retryAfterMs?: number } {
+        return (
+            !!err &&
+            typeof err === 'object' &&
+            (err as { code?: unknown }).code === 'INVOKE_RATE_LIMIT_GATE'
+        );
+    }
+
+    private armInvokeRateLimit(context: DeviceContext, scope: InvokeRateLimitScope): number {
+        const rateLimitKey = this.getInvokeRateLimitKey(context.key, scope);
+        const currentBackoff = this.invokeRateLimitBackoffMsByDevice.get(rateLimitKey) ?? INVOKE_RATE_LIMIT_BACKOFF_INITIAL_MS;
+        const cooldownMs = Math.max(INVOKE_RATE_LIMIT_BACKOFF_INITIAL_MS, Math.min(INVOKE_RATE_LIMIT_BACKOFF_MAX_MS, currentBackoff));
+        this.invokeRateLimitedUntilByDevice.set(rateLimitKey, Date.now() + cooldownMs);
+        this.invokeRateLimitBackoffMsByDevice.set(
+            rateLimitKey,
+            Math.min(INVOKE_RATE_LIMIT_BACKOFF_MAX_MS, cooldownMs * 2),
+        );
+        return cooldownMs;
+    }
+
+    private resetInvokeRateLimit(context: DeviceContext, scope: InvokeRateLimitScope): void {
+        const rateLimitKey = this.getInvokeRateLimitKey(context.key, scope);
+        this.invokeRateLimitedUntilByDevice.delete(rateLimitKey);
+        this.invokeRateLimitBackoffMsByDevice.set(rateLimitKey, INVOKE_RATE_LIMIT_BACKOFF_INITIAL_MS);
+    }
+
+    private resetJwtMqttReconnectBackoff(): void {
+        this.jwtMqttReconnectBackoffMs = JWT_MQTT_RECONNECT_MIN_MS;
+        if (this.mqttClient?.options && typeof this.mqttClient.options === 'object') {
+            this.mqttClient.options.reconnectPeriod = this.jwtMqttReconnectBackoffMs;
+        }
+    }
+
+    private bumpJwtMqttReconnectBackoff(): number {
+        this.jwtMqttReconnectBackoffMs = Math.min(
+            JWT_MQTT_RECONNECT_MAX_MS,
+            Math.max(JWT_MQTT_RECONNECT_MIN_MS, this.jwtMqttReconnectBackoffMs * 2),
+        );
+        if (this.mqttClient?.options && typeof this.mqttClient.options === 'object') {
+            this.mqttClient.options.reconnectPeriod = this.jwtMqttReconnectBackoffMs;
+        }
+        return this.jwtMqttReconnectBackoffMs;
+    }
+
+    private isJwtMqttAuthLikeError(msg: string): boolean {
+        const lower = msg.toLowerCase();
+        return (
+            lower.includes('not authorized') ||
+            lower.includes('bad user name or password') ||
+            lower.includes('invalid token') ||
+            lower.includes('auth') ||
+            lower.includes('forbidden')
+        );
     }
 
     private async onReady(): Promise<void> {
@@ -237,7 +350,7 @@ class Mammotion extends utils.Adapter {
             await this.refreshSessionAndDeviceCache();
             await this.subscribeStatesAsync('devices.*.commands.*');
             await this.subscribeStatesAsync('devices.*.zones.*.start');
-            await this.requestAreaNamesForAllDevices();
+            this.triggerAreaNameMissingRequest('startup');
 
             this.log.info(
                 `Initialization successful: ${this.deviceContexts.size} device(s), telemetry via ${
@@ -292,18 +405,25 @@ class Mammotion extends utils.Adapter {
             this.areaNameRequestRound.clear();
             this.areaNameCooldownUntil.clear();
             this.areaNameRateLimitHits.clear();
+            this.areaNameAwaitOnline.clear();
             this.areaNameMissingRequestInFlight = false;
             this.lastAreaNameMissingRequestAt = 0;
+            this.cloudOfflineByDevice.clear();
             this.invokeRateLimitedUntilByDevice.clear();
             this.invokeRateLimitBackoffMsByDevice.clear();
+            this.invokeQueueByDevice.clear();
+            this.invokeLastFinishedAtByDevice.clear();
             this.jwtMqttConnectedAt = 0;
             this.jwtMqttFastFailCount = 0;
             this.jwtMqttRecoverInFlight = false;
             this.jwtMqttLastRecoverAt = 0;
             this.jwtMqttSuppressedUntil = 0;
             this.jwtMqttLastDisconnectAt = 0;
+            this.jwtMqttReconnectBackoffMs = JWT_MQTT_RECONNECT_MIN_MS;
+            this.jwtMqttLastAuthErrorAt = 0;
             this.hashFrameAccumulator.clear();
             this.hashFrameAcked.clear();
+            this.hashListAreaOnlyByDevice.clear();
             this.stopLegacyPolling();
             this.syncConnectionStates();
             callback();
@@ -341,6 +461,45 @@ class Mammotion extends utils.Adapter {
     private setAliyunMqttConnected(connected: boolean): void {
         this.aliyunMqttConnected = connected;
         this.syncConnectionStates();
+    }
+
+    private isDeviceOfflineError(err: unknown): boolean {
+        const lower = this.extractAxiosError(err).toLowerCase();
+        return (
+            lower.includes('device is offline') ||
+            lower.includes('the device is offline') ||
+            lower.includes('code=6205') ||
+            lower.includes('code:6205') ||
+            lower.includes('50104')
+        );
+    }
+
+    private isDeviceCloudReportedOffline(context: DeviceContext): boolean {
+        return this.cloudOfflineByDevice.get(context.key) === true;
+    }
+
+    private markDeviceOnlineState(deviceKey: string, online: boolean, source: string): void {
+        const previous = this.cloudOfflineByDevice.get(deviceKey);
+        const offlineNow = !online;
+        this.cloudOfflineByDevice.set(deviceKey, offlineNow);
+        if (previous === undefined || previous === offlineNow) {
+            return;
+        }
+
+        const ctx = this.deviceContexts.get(deviceKey);
+        if (ctx) {
+            this.log.debug(
+                `[ONLINE] ${ctx.deviceName || ctx.iotId}: ${online ? 'online' : 'offline'} (source=${source})`,
+            );
+        }
+        if (online && this.areaNameAwaitOnline.has(deviceKey)) {
+            this.areaNameAwaitOnline.delete(deviceKey);
+            const retryContext = this.deviceContexts.get(deviceKey);
+            if (retryContext && this.isZoneCapableDevice(retryContext)) {
+                this.ensureAreaNameRetryRunning(deviceKey);
+                this.triggerAreaNameMissingRequest('device-online');
+            }
+        }
     }
 
     private teardownJwtMqttClient(): void {
@@ -1098,6 +1257,7 @@ class Mammotion extends utils.Adapter {
                 context,
                 stop ? 'request-iot-sync-stop' : 'request-iot-sync',
                 (session, _context) => this.buildRequestIotSyncContent(session, stop),
+                'sync',
             );
         } catch (err) {
             this.log.debug(
@@ -1267,6 +1427,9 @@ class Mammotion extends utils.Adapter {
         this.areaNameRequestRound.clear();
         this.hashFrameAccumulator.clear();
         this.hashFrameAcked.clear();
+        this.hashListAreaOnlyByDevice.clear();
+        this.areaNameAwaitOnline.clear();
+        this.cloudOfflineByDevice.clear();
 
         const devicesByIotId = new Map<string, MammotionDevice>();
         const recordsByIotId = new Map<string, DeviceRecord>();
@@ -1307,6 +1470,7 @@ class Mammotion extends utils.Adapter {
                 productSeries: device?.productSeries || '',
             };
             this.deviceContexts.set(key, context);
+            this.cloudOfflineByDevice.set(key, (context.status ?? 0) !== 1);
 
             if (context.productKey && context.recordDeviceName) {
                 this.mqttTopicMap.set(`${context.productKey}/${context.recordDeviceName}`, key);
@@ -1356,6 +1520,49 @@ class Mammotion extends utils.Adapter {
         }
     }
 
+    private buildJwtMqttTopics(records: DeviceRecord[]): string[] {
+        const topics = new Set<string>();
+        for (const record of records) {
+            if (!record.productKey || !record.deviceName) {
+                continue;
+            }
+            topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/status`);
+            topics.add(`/sys/${record.productKey}/${record.deviceName}/thing/event/+/post`);
+            topics.add(`/sys/proto/${record.productKey}/${record.deviceName}/thing/event/+/post`);
+            topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/properties`);
+            topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/events`);
+            topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/model/down_raw`);
+            topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/_thing/event/notify`);
+            topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/event/property/post_reply`);
+            topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/service/invoke/reply`);
+            topics.add(`/sys/${record.productKey}/${record.deviceName}/thing/event/property/post`);
+        }
+        return [...topics.values()];
+    }
+
+    private subscribeJwtMqttTopics(client: any, records: DeviceRecord[]): void {
+        const isDeviceTopic = (t: string): boolean => t.includes('/thing/event/') || t.includes('/thing/event/+/');
+        for (const topic of this.buildJwtMqttTopics(records)) {
+            if (this.subscribedDeviceTopics.has(topic)) {
+                continue;
+            }
+            this.subscribedDeviceTopics.add(topic);
+            client.subscribe(topic, (err: Error | null) => {
+                if (err) {
+                    this.subscribedDeviceTopics.delete(topic);
+                    const msg = `${err.message || ''}`.toLowerCase();
+                    if (msg.includes('connection closed') || msg.includes('client disconnect')) {
+                        this.log.debug(`MQTT subscribe interrupted (${topic}): ${err.message}`);
+                    } else {
+                        this.log.warn(`MQTT subscribe failed (${topic}): ${err.message}`);
+                    }
+                } else if (isDeviceTopic(topic)) {
+                    this.log.debug(`[MQTT] Physical device topic reachable: ${topic}`);
+                }
+            });
+        }
+    }
+
     private async connectMqtt(mqttAuth: MqttConnection, records: DeviceRecord[]): Promise<void> {
         this.teardownJwtMqttClient();
 
@@ -1364,7 +1571,7 @@ class Mammotion extends utils.Adapter {
             clientId: mqttAuth.clientId,
             username: mqttAuth.username,
             password: mqttAuth.jwt,
-            reconnectPeriod: 5000,
+            reconnectPeriod: this.jwtMqttReconnectBackoffMs,
             connectTimeout: 15000,
             protocolVersion: 4,
             clean: true,
@@ -1383,34 +1590,11 @@ class Mammotion extends utils.Adapter {
             this.setCloudConnected(true);
             this.authFailureSince = 0;
             this.jwtMqttConnectedAt = Date.now();
-
-            const topics = new Set<string>();
-            for (const record of records) {
-                if (record.productKey && record.deviceName) {
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/status`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/thing/event/+/post`);
-                    topics.add(`/sys/proto/${record.productKey}/${record.deviceName}/thing/event/+/post`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/properties`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/events`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/model/down_raw`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/_thing/event/notify`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/event/property/post_reply`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/app/down/thing/service/invoke/reply`);
-                    topics.add(`/sys/${record.productKey}/${record.deviceName}/thing/event/property/post`);
-                }
-            }
-
-            const isDeviceTopic = (t: string): boolean =>
-                t.includes('/thing/event/') || t.includes('/thing/event/+/');
-            for (const topic of topics) {
-                client.subscribe(topic, (err: Error | null) => {
-                    if (err) {
-                        this.log.warn(`MQTT subscribe failed (${topic}): ${err.message}`);
-                    } else if (isDeviceTopic(topic)) {
-                        this.log.debug(`[MQTT] Physical device topic reachable: ${topic}`);
-                    }
-                });
-            }
+            this.jwtMqttFastFailCount = 0;
+            this.jwtMqttLastAuthErrorAt = 0;
+            this.resetJwtMqttReconnectBackoff();
+            this.subscribeJwtMqttTopics(client, records);
+            this.triggerAreaNameMissingRequest('jwt-connect');
 
             // JWT connection may flap quickly for shared devices; area-name refresh is triggered
             // on the Aliyun fallback channel to avoid excessive request bursts.
@@ -1423,6 +1607,9 @@ class Mammotion extends utils.Adapter {
         client.on('error', (err: Error) => {
             try {
                 this.log.warn(`MQTT error: ${err.message}`);
+                if (this.isJwtMqttAuthLikeError(err.message)) {
+                    this.jwtMqttLastAuthErrorAt = Date.now();
+                }
                 void this.setStateChangedAsync('info.lastError', `MQTT: ${err.message}`, true);
                 void this.ensureAliyunMqttRunning('jwt-error');
             } catch {
@@ -1460,13 +1647,29 @@ class Mammotion extends utils.Adapter {
         const wasFastFail = this.jwtMqttConnectedAt > 0 && now - this.jwtMqttConnectedAt <= JWT_MQTT_FAST_FAIL_WINDOW_MS;
         if (wasFastFail) {
             this.jwtMqttFastFailCount += 1;
+            const nextBackoffMs = this.bumpJwtMqttReconnectBackoff();
+            this.log.debug(
+                `JWT MQTT fast disconnect detected (${this.jwtMqttFastFailCount}/${JWT_MQTT_FAST_FAIL_THRESHOLD}). ` +
+                `Reconnect backoff set to ${Math.ceil(nextBackoffMs / 1000)}s.`,
+            );
         } else {
             this.jwtMqttFastFailCount = 0;
+            this.resetJwtMqttReconnectBackoff();
         }
         this.jwtMqttConnectedAt = 0;
 
         if (this.jwtMqttFastFailCount >= JWT_MQTT_FAST_FAIL_THRESHOLD) {
-            void this.recoverJwtMqttAfterFlapping();
+            const authLike = now - this.jwtMqttLastAuthErrorAt <= JWT_MQTT_FAST_FAIL_WINDOW_MS;
+            if (authLike) {
+                void this.recoverJwtMqttAfterFlapping();
+            } else {
+                this.log.warn(
+                    `JWT MQTT disconnected ${this.jwtMqttFastFailCount} times within ${Math.round(
+                        JWT_MQTT_FAST_FAIL_WINDOW_MS / 1000,
+                    )}s. Using reconnect backoff (no forced credential refresh).`,
+                );
+                this.jwtMqttFastFailCount = 0;
+            }
         }
 
         void this.ensureAliyunMqttRunning(`jwt-${reason}`);
@@ -1484,19 +1687,12 @@ class Mammotion extends utils.Adapter {
         this.jwtMqttLastRecoverAt = now;
         try {
             this.log.warn(
-                `JWT MQTT disconnected ${this.jwtMqttFastFailCount} times within ${Math.round(
-                    JWT_MQTT_FAST_FAIL_WINDOW_MS / 1000,
-                )}s. Refreshing session + MQTT credentials.`,
+                `JWT MQTT disconnected ${this.jwtMqttFastFailCount} times with auth-like errors. Refreshing session + MQTT credentials.`,
             );
-            this.jwtMqttSuppressedUntil = Date.now() + JWT_MQTT_SUPPRESS_AFTER_FLAP_MS;
-            this.teardownJwtMqttClient();
-            this.log.warn(
-                `JWT MQTT temporarily suppressed for ${Math.round(
-                    JWT_MQTT_SUPPRESS_AFTER_FLAP_MS / 60_000,
-                )}m due to flapping.`,
-            );
+            this.resetJwtMqttReconnectBackoff();
             await this.refreshSessionAndDeviceCache();
             this.jwtMqttFastFailCount = 0;
+            this.jwtMqttLastAuthErrorAt = 0;
         } catch (err) {
             this.log.debug(`JWT MQTT recovery failed: ${this.extractAxiosError(err)}`);
         } finally {
@@ -1646,17 +1842,25 @@ class Mammotion extends utils.Adapter {
             params?.status?.value,
             params?.items?.iotState?.value,
             params?.iotState,
+            data?.status?.value,
+            data?.items?.iotState?.value,
+            data?.iotState,
             data.iotState?.value,
             data.iotState,
         );
         if (statusValue !== null) {
-            await this.setStateChangedAsync(`${channelId}.telemetry.connected`, statusValue === 1, true);
+            const isOnline = statusValue === 1;
+            await this.setStateChangedAsync(`${channelId}.telemetry.connected`, isOnline, true);
+            this.markDeviceOnlineState(deviceKey, isOnline, 'mqtt-status');
         }
 
         const batteryValue = this.pickNumber(
             params?.items?.batteryPercentage?.value,
             params?.batteryPercentage?.value,
             params?.batteryPercentage,
+            data?.items?.batteryPercentage?.value,
+            data?.batteryPercentage?.value,
+            data?.batteryPercentage,
             data.batteryPercentage?.value,
             data.batteryPercentage,
         );
@@ -1668,6 +1872,9 @@ class Mammotion extends utils.Adapter {
             params?.items?.knifeHeight?.value,
             params?.knifeHeight?.value,
             params?.knifeHeight,
+            data?.items?.knifeHeight?.value,
+            data?.knifeHeight?.value,
+            data?.knifeHeight,
             data.knifeHeight?.value,
             data.knifeHeight,
         );
@@ -1679,6 +1886,9 @@ class Mammotion extends utils.Adapter {
             params?.items?.deviceState?.value,
             params?.deviceState?.value,
             params?.deviceState,
+            data?.items?.deviceState?.value,
+            data?.deviceState?.value,
+            data?.deviceState,
             data.deviceState?.value,
             data.deviceState,
         );
@@ -1691,6 +1901,9 @@ class Mammotion extends utils.Adapter {
             params?.items?.coordinate?.value ??
             params?.coordinate?.value ??
             params?.coordinate ??
+            data?.items?.coordinate?.value ??
+            data?.coordinate?.value ??
+            data?.coordinate ??
             data.coordinate?.value ??
             data.coordinate;
         if (coordinateValue) {
@@ -1713,6 +1926,7 @@ class Mammotion extends utils.Adapter {
 
         const fwVersionMqtt =
             params?.items?.deviceVersion?.value ?? params?.deviceVersion?.value ?? params?.deviceVersion ??
+            data?.items?.deviceVersion?.value ?? data?.deviceVersion?.value ?? data?.deviceVersion ??
             data.deviceVersion?.value ?? data.deviceVersion;
         if (typeof fwVersionMqtt === 'string' && fwVersionMqtt) {
             await this.setStateChangedAsync(`${channelId}.telemetry.firmwareVersion`, fwVersionMqtt, true);
@@ -1720,6 +1934,7 @@ class Mammotion extends utils.Adapter {
 
         const networkInfoRawMqtt =
             params?.items?.networkInfo?.value ?? params?.networkInfo?.value ?? params?.networkInfo ??
+            data?.items?.networkInfo?.value ?? data?.networkInfo?.value ?? data?.networkInfo ??
             data.networkInfo?.value ?? data.networkInfo;
         const networkInfoMqtt =
             typeof networkInfoRawMqtt === 'string'
@@ -1736,6 +1951,7 @@ class Mammotion extends utils.Adapter {
 
         const deviceOtherInfoRawMqtt =
             params?.items?.deviceOtherInfo?.value ?? params?.deviceOtherInfo?.value ?? params?.deviceOtherInfo ??
+            data?.items?.deviceOtherInfo?.value ?? data?.deviceOtherInfo?.value ?? data?.deviceOtherInfo ??
             data.deviceOtherInfo?.value ?? data.deviceOtherInfo;
         const deviceOtherInfoMqtt =
             typeof deviceOtherInfoRawMqtt === 'string'
@@ -1818,6 +2034,57 @@ class Mammotion extends utils.Adapter {
         }
     }
 
+    private async runSerializedDeviceInvoke<T>(
+        context: DeviceContext,
+        scope: InvokeRateLimitScope,
+        taskLabel: string,
+        task: () => Promise<T>,
+    ): Promise<T> {
+        const useGlobalAreaQueue = scope === 'area';
+        let releaseGlobal: ((value?: void | PromiseLike<void>) => void) | undefined;
+        let previousGlobal: Promise<void> = Promise.resolve();
+        if (useGlobalAreaQueue) {
+            previousGlobal = this.areaInvokeGlobalQueue;
+            const currentGlobal = new Promise<void>(resolve => {
+                releaseGlobal = resolve;
+            });
+            this.areaInvokeGlobalQueue = previousGlobal.catch(() => undefined).then(() => currentGlobal);
+        }
+
+        const deviceKey = context.key;
+        const previous = this.invokeQueueByDevice.get(deviceKey) ?? Promise.resolve();
+        let releaseCurrent: ((value?: void | PromiseLike<void>) => void) | undefined;
+        const current = new Promise<void>(resolve => {
+            releaseCurrent = resolve;
+        });
+        this.invokeQueueByDevice.set(deviceKey, previous.catch(() => undefined).then(() => current));
+
+        await previousGlobal.catch(() => undefined);
+        await previous.catch(() => undefined);
+        try {
+            const lastFinishedAt = this.invokeLastFinishedAtByDevice.get(deviceKey) ?? 0;
+            const deviceWaitMs = INVOKE_SERIAL_MIN_GAP_MS - (Date.now() - lastFinishedAt);
+            const globalAreaWaitMs = useGlobalAreaQueue
+                ? AREA_INVOKE_GLOBAL_MIN_GAP_MS - (Date.now() - this.areaInvokeLastFinishedAt)
+                : 0;
+            const waitMs = Math.max(deviceWaitMs, globalAreaWaitMs, 0);
+            if (waitMs > 0) {
+                this.log.debug(
+                    `[INVOKE] Serial wait ${waitMs}ms for ${context.deviceName || context.iotId} (${scope}:${taskLabel}).`,
+                );
+                await this.sleepMs(waitMs);
+            }
+            return await task();
+        } finally {
+            this.invokeLastFinishedAtByDevice.set(deviceKey, Date.now());
+            if (useGlobalAreaQueue) {
+                this.areaInvokeLastFinishedAt = Date.now();
+            }
+            releaseCurrent?.();
+            releaseGlobal?.();
+        }
+    }
+
     private async invokeTaskControlCommandModern(session: AuthSession, context: DeviceContext, content: string): Promise<string> {
         const invoke = async (deviceName: string, productKey: string): Promise<MammotionApiResponse<{ result?: string }>> => {
             const response = await axios.post<MammotionApiResponse<{ result?: string }>>(
@@ -1846,9 +2113,17 @@ class Mammotion extends utils.Adapter {
             return response.data;
         };
 
-        let response = await invoke(context.recordDeviceName || context.deviceName || '', context.productKey || '');
-        if (response.code === 50101) {
-            response = await invoke('', '');
+        const firstDeviceName = context.recordDeviceName || context.deviceName || '';
+        const firstProductKey = context.productKey || '';
+        let response = await invoke(firstDeviceName, firstProductKey);
+        if (response.code !== 0 && (firstDeviceName || firstProductKey)) {
+            this.log.debug(
+                `[MODERN-INVOKE] first call failed for ${context.deviceName || context.iotId} (code=${response.code}, msg=${response.msg || ''}), retrying with empty deviceName/productKey.`,
+            );
+            const fallbackResponse = await invoke('', '');
+            if (fallbackResponse.code === 0 || response.code === 50101) {
+                response = fallbackResponse;
+            }
         }
 
         if (response.code !== 0) {
@@ -1862,33 +2137,41 @@ class Mammotion extends utils.Adapter {
         session: AuthSession,
         context: DeviceContext,
         content: string,
+        scope: InvokeRateLimitScope = 'command',
     ): Promise<string> {
-        if (this.legacyOnlyCommandDevices.has(context.key)) {
-            return this.invokeTaskControlCommandLegacy(session, context, content);
-        }
-        try {
-            return await this.invokeTaskControlCommandModern(session, context, content);
-        } catch (err) {
-            const msg = this.extractAxiosError(err).toLowerCase();
-            this.log.debug(`[MODERN-INVOKE] failed for ${context.deviceName || context.iotId}: ${msg}`);
-            // Fall through to legacy for "Invalid device" (Luba1/legacy devices) and
-            // "Access to this resource requires authentication" (shared-account devices).
-            // Legacy uses iotToken which is independent of the modern Bearer JWT.
-            if (!msg.includes('invalid device') && !msg.includes('access to this resource')) {
-                throw err;
+        return this.runSerializedDeviceInvoke(context, scope, 'invoke-fallback', async () => {
+            if (this.legacyOnlyCommandDevices.has(context.key)) {
+                return this.invokeTaskControlCommandLegacy(session, context, content, scope);
             }
-            this.legacyOnlyCommandDevices.add(context.key);
-        }
+            try {
+                return await this.invokeTaskControlCommandModern(session, context, content);
+            } catch (err) {
+                const msg = this.extractAxiosError(err).toLowerCase();
+                this.log.debug(`[MODERN-INVOKE] failed for ${context.deviceName || context.iotId}: ${msg}`);
+                // Fall through to legacy for "Invalid device" (Luba1/legacy devices) and
+                // "Access to this resource requires authentication" (shared-account devices).
+                // Legacy uses iotToken which is independent of the modern Bearer JWT.
+                const unsupportedModernPath =
+                    msg.includes('invalid device') || msg.includes('access to this resource');
+                const tryLegacyForAreaOffline = false;
+                if (!unsupportedModernPath && !tryLegacyForAreaOffline) {
+                    throw err;
+                }
+                if (unsupportedModernPath) {
+                    this.legacyOnlyCommandDevices.add(context.key);
+                }
+            }
 
-        this.log.warn(`Modern command path not supported for ${context.deviceName || context.iotId}, using Aliyun fallback.`);
-        return this.invokeTaskControlCommandLegacy(session, context, content);
+            this.log.warn(`Modern command path not supported for ${context.deviceName || context.iotId}, using Aliyun fallback.`);
+            return this.invokeTaskControlCommandLegacy(session, context, content, scope);
+        });
     }
 
     private async executeTaskControlCommand(context: DeviceContext, command: DeviceCommand): Promise<string> {
         const session = await this.ensureValidSession(!this.cloudConnected);
         const content = this.buildTaskControlContent(session, context, command);
         try {
-            return await this.invokeTaskControlCommandWithFallback(session, context, content);
+            return await this.invokeTaskControlCommandWithFallback(session, context, content, 'command');
         } catch (err) {
             const msg = this.extractAxiosError(err);
             if (!this.isRetryableCommandError(msg, err)) {
@@ -1901,7 +2184,7 @@ class Mammotion extends utils.Adapter {
             const refreshedContext = this.deviceContexts.get(context.key) || context;
             const retrySession = await this.ensureValidSession(true);
             const retryContent = this.buildTaskControlContent(retrySession, refreshedContext, command);
-            return this.invokeTaskControlCommandWithFallback(retrySession, refreshedContext, retryContent);
+            return this.invokeTaskControlCommandWithFallback(retrySession, refreshedContext, retryContent, 'command');
         }
     }
 
@@ -1909,9 +2192,9 @@ class Mammotion extends utils.Adapter {
         const session = await this.ensureValidSession(!this.cloudConnected);
         try {
             const bladeContent = this.buildSetBladeHeightContent(session, cutHeightMm);
-            const bladeResult = await this.invokeTaskControlCommandWithFallback(session, context, bladeContent);
+            const bladeResult = await this.invokeTaskControlCommandWithFallback(session, context, bladeContent, 'command');
             const speedContent = this.buildSetMowSpeedContent(session, mowSpeedMs);
-            const speedResult = await this.invokeTaskControlCommandWithFallback(session, context, speedContent);
+            const speedResult = await this.invokeTaskControlCommandWithFallback(session, context, speedContent, 'command');
             return `blade:${bladeResult};speed:${speedResult}`;
         } catch (err) {
             const msg = this.extractAxiosError(err);
@@ -1930,17 +2213,19 @@ class Mammotion extends utils.Adapter {
                     retrySession,
                     refreshedContext,
                     retryBladeContent,
+                    'command',
                 );
                 const retrySpeedContent = this.buildSetMowSpeedContent(retrySession, mowSpeedMs);
                 const retrySpeedResult = await this.invokeTaskControlCommandWithFallback(
                     retrySession,
                     refreshedContext,
                     retrySpeedContent,
+                    'command',
                 );
                 return `blade:${retryBladeResult};speed:${retrySpeedResult}`;
             } catch (_retryErr) {
                 const fallbackContent = this.buildTaskSettingsContent(retrySession, cutHeightMm, mowSpeedMs);
-                return this.invokeTaskControlCommandWithFallback(retrySession, refreshedContext, fallbackContent);
+                return this.invokeTaskControlCommandWithFallback(retrySession, refreshedContext, fallbackContent, 'command');
             }
         }
     }
@@ -1949,9 +2234,10 @@ class Mammotion extends utils.Adapter {
         context: DeviceContext,
         commandLabel: string,
         buildContent: (session: AuthSession, context: DeviceContext) => string,
+        scope: InvokeRateLimitScope = 'command',
     ): Promise<string> {
         const invokeCommand = async (session: AuthSession, ctx: DeviceContext, content: string): Promise<string> =>
-            this.invokeTaskControlCommandWithFallback(session, ctx, content);
+            this.invokeTaskControlCommandWithFallback(session, ctx, content, scope);
         const session = await this.ensureValidSession(!this.cloudConnected);
         const content = buildContent(session, context);
         try {
@@ -2031,6 +2317,9 @@ class Mammotion extends utils.Adapter {
                     this.teardownJwtMqttClient();
                 }
             }
+        } else if (records.length && this.mqttClient) {
+            // Keep subscriptions in sync when devices are added while JWT MQTT stays connected.
+            this.subscribeJwtMqttTopics(this.mqttClient, records);
         }
         if (!records.length) {
             this.teardownJwtMqttClient();
@@ -2159,29 +2448,20 @@ class Mammotion extends utils.Adapter {
         }
     }
 
-    private async invokeTaskControlCommandLegacy(session: AuthSession, context: DeviceContext, content: string): Promise<string> {
+    private async invokeTaskControlCommandLegacy(
+        session: AuthSession,
+        context: DeviceContext,
+        content: string,
+        scope: InvokeRateLimitScope = 'command',
+    ): Promise<string> {
+        const scopeLabel = this.getInvokeScopeLabel(scope);
+        const scopeLogPrefix = this.getInvokeScopeLogPrefix(scope);
+
         const checkInvokeRateLimitGate = (): void => {
-            const until = this.invokeRateLimitedUntilByDevice.get(context.key) ?? 0;
-            const remainingMs = until - Date.now();
+            const remainingMs = this.getInvokeRateLimitRemainingMs(context, scope);
             if (remainingMs > 0) {
-                throw new Error(`Cloud command invoke is rate-limited. Retry in ${Math.ceil(remainingMs / 1000)}s.`);
+                throw this.createInvokeRateLimitGateError(scopeLabel, remainingMs);
             }
-        };
-
-        const armInvokeRateLimit = (): number => {
-            const currentBackoff = this.invokeRateLimitBackoffMsByDevice.get(context.key) ?? INVOKE_RATE_LIMIT_BACKOFF_INITIAL_MS;
-            const cooldownMs = Math.max(INVOKE_RATE_LIMIT_BACKOFF_INITIAL_MS, Math.min(INVOKE_RATE_LIMIT_BACKOFF_MAX_MS, currentBackoff));
-            this.invokeRateLimitedUntilByDevice.set(context.key, Date.now() + cooldownMs);
-            this.invokeRateLimitBackoffMsByDevice.set(
-                context.key,
-                Math.min(INVOKE_RATE_LIMIT_BACKOFF_MAX_MS, cooldownMs * 2),
-            );
-            return cooldownMs;
-        };
-
-        const resetInvokeRateLimit = (): void => {
-            this.invokeRateLimitedUntilByDevice.delete(context.key);
-            this.invokeRateLimitBackoffMsByDevice.set(context.key, INVOKE_RATE_LIMIT_BACKOFF_INITIAL_MS);
         };
 
         const invoke = async (forceSessionRefresh: boolean): Promise<LegacyInvokeData | null> => {
@@ -2201,7 +2481,7 @@ class Mammotion extends utils.Adapter {
             if (response.code !== 200) {
                 throw new Error(this.extractLegacyApiMessage(response, 'Legacy invoke failed'));
             }
-            resetInvokeRateLimit();
+            this.resetInvokeRateLimit(context, scope);
             return response.data || null;
         };
 
@@ -2216,9 +2496,9 @@ class Mammotion extends utils.Adapter {
             return syncContent;
         } catch (err) {
             if (this.isRateLimitError(err)) {
-                const cooldownMs = armInvokeRateLimit();
+                const cooldownMs = this.armInvokeRateLimit(context, scope);
                 this.log.warn(
-                    `[CMD] Rate limit hit for ${context.deviceName || context.iotId}. Backing off command invoke for ${Math.ceil(
+                    `[${scopeLogPrefix}] Rate limit hit for ${context.deviceName || context.iotId}. Backing off ${scopeLabel} for ${Math.ceil(
                         cooldownMs / 1000,
                     )}s.`,
                 );
@@ -3341,7 +3621,9 @@ class Mammotion extends utils.Adapter {
 
         const online = this.pickNumber(items?.iotState?.value, items?.iotState, data.iotState?.value, data.iotState, data.status);
         if (online !== null) {
-            await this.setStateChangedAsync(`${channelId}.telemetry.connected`, online === 1, true);
+            const isOnline = online === 1;
+            await this.setStateChangedAsync(`${channelId}.telemetry.connected`, isOnline, true);
+            this.markDeviceOnlineState(channelId.replace('devices.', ''), isOnline, 'legacy-snapshot');
         }
 
         const coordinateValue =
@@ -3922,6 +4204,29 @@ class Mammotion extends utils.Adapter {
         return hint.includes('yuka');
     }
 
+    private isZoneCapableDevice(context?: DeviceContext): boolean {
+        if (!context) {
+            return false;
+        }
+        const group = resolveProductKeyGroup(context.productKey) || '';
+        if (group.startsWith('RTK')) {
+            return false;
+        }
+        if (group.startsWith('Luba') || group.startsWith('Yuka')) {
+            return true;
+        }
+
+        const type = this.getDeviceTypeCode(context);
+        if (type !== null && [0, 9, 10, 12, 13, 19, 20, 22].includes(type)) {
+            return false;
+        }
+        const hint = `${context.deviceName} ${context.series || ''} ${context.productSeries || ''}`.toLowerCase();
+        if (hint.includes('rtk') || hint.includes('spino')) {
+            return false;
+        }
+        return true;
+    }
+
     private isYukaMiniDevice(context?: DeviceContext): boolean {
         if (!context) {
             return false;
@@ -4142,6 +4447,7 @@ class Mammotion extends utils.Adapter {
         try {
             await this.executeEncodedContentCommand(context, 'hash-list-ack', (_session, ctx) =>
                 this.buildNavGetHashAckContent(_session, ctx, totalFrame, currentFrame),
+                'area',
             );
             this.log.debug(`[ZONE] ack gethash frame ${currentFrame}/${totalFrame} for ${context.deviceName || context.iotId}`);
         } catch (err) {
@@ -4149,6 +4455,25 @@ class Mammotion extends utils.Adapter {
                 `[ZONE] gethash ack failed for ${context.deviceName || context.iotId} frame ${currentFrame}/${totalFrame}: ${this.extractAxiosError(err)}`,
             );
         }
+    }
+
+    private async waitForAreaSignalAfterMapName(
+        deviceKey: string,
+        namesBefore: number,
+        classifiedBefore: number,
+        hashSetBefore: string,
+    ): Promise<boolean> {
+        const deadline = Date.now() + AREA_NAME_MAP_NAME_SETTLE_MS;
+        while (Date.now() < deadline) {
+            const namesNow = this.pendingAreaNamesByDevice.get(deviceKey)?.size ?? 0;
+            const classifiedNow = this.classifiedAreaHashesByDevice.get(deviceKey)?.size ?? 0;
+            const hashSetNow = this.lastRequestedHashSetByDevice.get(deviceKey) ?? '';
+            if (namesNow > namesBefore || classifiedNow > classifiedBefore || hashSetNow !== hashSetBefore) {
+                return true;
+            }
+            await this.sleepMs(AREA_NAME_SIGNAL_POLL_MS);
+        }
+        return false;
     }
 
     private async sendAreaNameListRequest(context: DeviceContext): Promise<boolean> {
@@ -4161,6 +4486,30 @@ class Mammotion extends utils.Adapter {
                 `[AREA-REQ] Aliyun MQTT not connected for ${context.deviceName || context.iotId}; postponing zone request.`,
             );
             await this.ensureAliyunMqttRunning('area-name-request');
+            return false;
+        }
+        if (this.isDeviceCloudReportedOffline(context)) {
+            this.areaNameAwaitOnline.add(context.key);
+            this.log.debug(
+                `[AREA-REQ] ${context.deviceName || context.iotId} is currently cloud-offline; waiting for online status before requesting zones.`,
+            );
+            return false;
+        }
+        if (!this.jwtMqttConnected && !this.legacyOnlyCommandDevices.has(context.key)) {
+            this.log.debug(
+                `[AREA-REQ] JWT MQTT not connected for ${context.deviceName || context.iotId}; waiting for modern channel before requesting zones.`,
+            );
+            return false;
+        }
+
+        const invokeCooldownRemainingMs = this.getInvokeRateLimitRemainingMs(context, 'area');
+        if (invokeCooldownRemainingMs > 0) {
+            this.areaNameCooldownUntil.set(context.key, Date.now() + invokeCooldownRemainingMs);
+            this.log.debug(
+                `[AREA-REQ] Invoke cooldown active for ${context.deviceName || context.iotId}, skipping for another ${Math.ceil(
+                    invokeCooldownRemainingMs / 1000,
+                )}s.`,
+            );
             return false;
         }
 
@@ -4183,66 +4532,108 @@ class Mammotion extends utils.Adapter {
             }
             this.areaNameLastRequestAt.set(context.key, Date.now());
 
-            const primaryReceiver = this.getReceiverDevice(context);
-            const receivers = new Set<number>([primaryReceiver]);
-            // Some Yuka firmware revisions answer NavGetHashList only on receiver 17.
-            if (this.isYukaDevice(context)) {
-                receivers.add(17);
-                receivers.add(1);
-            }
-            const receiverList = [...receivers];
-            const round = this.areaNameRequestRound.get(context.key) ?? 0;
-            this.areaNameRequestRound.set(context.key, round + 1);
-            const receiver = receiverList[round % receiverList.length];
-            const phase = round % 3;
+            const receiver = this.getReceiverDevice(context);
+            const namesBefore = this.pendingAreaNamesByDevice.get(context.key)?.size ?? 0;
+            const classifiedBefore = this.classifiedAreaHashesByDevice.get(context.key)?.size ?? 0;
+            const hashSetBefore = this.lastRequestedHashSetByDevice.get(context.key) ?? '';
 
             await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
-            let commandLabel = 'area-name-list';
-            let buildContent: (session: AuthSession, context: DeviceContext) => string = (_session, ctx) =>
-                this.buildAreaNameListContent(_session, ctx, 0, receiver);
-            if (phase === 0) {
-                commandLabel = 'area-name-map-name';
-                buildContent = (_session, ctx) => this.buildAreaNameMapNameListContent(_session, ctx, receiver);
-            } else if (phase === 1) {
-                commandLabel = 'area-name-list-v3';
-                buildContent = (_session, ctx) => this.buildAreaNameListContent(_session, ctx, 3, receiver);
-            }
-            const result = await this.executeEncodedContentCommand(
+            const mapNameResult = await this.executeEncodedContentCommand(
                 context,
-                commandLabel,
-                buildContent,
+                'area-name-map-name',
+                (_session, ctx) => this.buildAreaNameMapNameListContent(_session, ctx, receiver),
+                'area',
             );
             this.log.debug(
-                `[AREA-REQ] ${commandLabel} response (receiver=${receiver}, len=${result?.length ?? 0}): ${result?.substring(0, 100)}`,
+                `[AREA-REQ] area-name-map-name response (receiver=${receiver}, len=${mapNameResult?.length ?? 0}): ${mapNameResult?.substring(0, 100)}`,
             );
+            this.markDeviceOnlineState(context.key, true, 'area-map-name');
 
-            if (!result || result === 'ok' || result.length <= 20) {
-                return true;
-            }
-
-            const directAreas = this.tryParseAreaHashNames(result);
+            const directAreas = mapNameResult && mapNameResult !== 'ok' && mapNameResult.length > 20
+                ? this.tryParseAreaHashNames(mapNameResult)
+                : null;
             if (directAreas && directAreas.length > 0) {
                 this.rememberAreaNames(context.key, directAreas);
                 // Names can include non-mowing map elements on some firmware revisions.
                 // Apply only to already-classified hashes (or known zones) until gethash confirms mowing hashes.
                 this.maybeApplyAreaNamesToStates(context.key, directAreas);
                 this.areaNameRateLimitHits.delete(context.key);
+                this.resetInvokeRateLimit(context, 'area');
                 return true;
             }
 
-            const hashIds = this.tryParseNavGetHashListAck(result, context.key);
+            const hashIds = mapNameResult && mapNameResult !== 'ok' && mapNameResult.length > 20
+                ? this.tryParseNavGetHashListAck(mapNameResult, context.key)
+                : null;
             if (hashIds && hashIds.length > 0) {
                 await this.requestAreaNamesForHashes(context, hashIds);
+                this.areaNameRateLimitHits.delete(context.key);
+                this.resetInvokeRateLimit(context, 'area');
+                return true;
+            }
+
+            const asyncSignalReceived = await this.waitForAreaSignalAfterMapName(
+                context.key,
+                namesBefore,
+                classifiedBefore,
+                hashSetBefore,
+            );
+            if (asyncSignalReceived) {
+                this.log.debug(`[AREA-REQ] map-name async signal received for ${context.deviceName || context.iotId}, skipping fallback gethash.`);
+                this.areaNameRateLimitHits.delete(context.key);
+                this.resetInvokeRateLimit(context, 'area');
+                return true;
+            }
+
+            // PyMammotion follow-up step: fetch root hash list (sub_cmd=0), then derive mowing zones
+            // from hash_len and frame assembly.
+            await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
+            const hashListResult = await this.executeEncodedContentCommand(
+                context,
+                'area-hash-list',
+                (_session, ctx) => this.buildAreaNameListContent(_session, ctx, 0, receiver),
+                'area',
+            );
+            this.log.debug(
+                `[AREA-REQ] area-hash-list response (receiver=${receiver}, len=${hashListResult?.length ?? 0}): ${hashListResult?.substring(0, 100)}`,
+            );
+            if (hashListResult && hashListResult !== 'ok' && hashListResult.length > 20) {
+                const fallbackHashIds = this.tryParseNavGetHashListAck(hashListResult, context.key);
+                if (fallbackHashIds && fallbackHashIds.length > 0) {
+                    await this.requestAreaNamesForHashes(context, fallbackHashIds);
+                }
             }
 
             this.areaNameRateLimitHits.delete(context.key);
+            this.resetInvokeRateLimit(context, 'area');
             return true;
         } catch (err) {
+            if (this.isDeviceOfflineError(err)) {
+                this.areaNameAwaitOnline.add(context.key);
+                this.markDeviceOnlineState(context.key, false, 'area-invoke');
+                this.log.debug(`[AREA-REQ] ${context.deviceName || context.iotId} reported offline; deferring zone request.`);
+                return false;
+            }
+            if (this.isInvokeRateLimitGateError(err)) {
+                const retryAfterMs = Math.max(
+                    1_000,
+                    Math.trunc(err.retryAfterMs ?? this.getInvokeRateLimitRemainingMs(context, 'area')),
+                );
+                this.areaNameCooldownUntil.set(context.key, Date.now() + retryAfterMs);
+                this.log.debug(
+                    `[AREA-REQ] Internal invoke gate active for ${context.deviceName || context.iotId}, deferring for ${Math.ceil(
+                        retryAfterMs / 1000,
+                    )}s.`,
+                );
+                return false;
+            }
             if (this.isRateLimitError(err)) {
                 const hits = (this.areaNameRateLimitHits.get(context.key) ?? 0) + 1;
                 this.areaNameRateLimitHits.set(context.key, hits);
                 const backoffMultiplier = Math.min(2 ** (hits - 1), 30);
-                const cooldownMs = Math.min(AREA_NAME_RATE_LIMIT_COOLDOWN_MS * backoffMultiplier, AREA_NAME_RATE_LIMIT_COOLDOWN_MAX_MS);
+                const areaCooldownMs = Math.min(AREA_NAME_RATE_LIMIT_COOLDOWN_MS * backoffMultiplier, AREA_NAME_RATE_LIMIT_COOLDOWN_MAX_MS);
+                const invokeCooldownMs = this.armInvokeRateLimit(context, 'area');
+                const cooldownMs = Math.max(areaCooldownMs, invokeCooldownMs);
                 this.areaNameCooldownUntil.set(context.key, Date.now() + cooldownMs);
                 const axiosErr = err as AxiosError;
                 const rateBodyRaw = axiosErr?.response?.data;
@@ -4313,19 +4704,104 @@ class Mammotion extends utils.Adapter {
 
             const hashSetKey = uniqueHashes.map(String).join(',');
             const prevHashSet = this.lastRequestedHashSetByDevice.get(context.key);
-            if (prevHashSet === hashSetKey && (await this.hasKnownAreas(context.key))) {
+            const existingAreas = await this.getKnownAreas(context.key);
+            if (
+                prevHashSet === hashSetKey &&
+                existingAreas.length > 0 &&
+                (await this.hasZoneStateCoverage(context.key, existingAreas.length))
+            ) {
                 return;
             }
             this.lastRequestedHashSetByDevice.set(context.key, hashSetKey);
 
+            const areaOnlyFromHashList = this.hashListAreaOnlyByDevice.get(context.key) ?? false;
+
+            // PyMammotion now treats the root hash list as the source of truth.
+            // If hash_len was present in NavGetHashListAck, the parsed list is already area-only.
+            // Avoid per-hash cloud invokes here to prevent 429 storms during discovery.
+            if (areaOnlyFromHashList) {
+                this.log.info(
+                    `[ZONE] ${uniqueHashes.length} mowing zones detected from NavGetHashListAck (hash_len). Applying without per-hash classify.`,
+                );
+                this.classifiedAreaHashesByDevice.set(context.key, new Set(uniqueHashes.map(h => h.toString())));
+                const names = this.pendingAreaNamesByDevice.get(context.key);
+                const existingNames = new Map(existingAreas.map(area => [area.hash.toString(), area.name]));
+                const areas = this.buildAreaListWithUniqueNames(uniqueHashes, names, existingNames);
+                await this.updateZoneStates(context.key, areas);
+                return;
+            }
+
+            // Classify each hash one at a time. The mower tends to ignore/timeout overlapping
+            // field-32 requests, so keep the request stream strictly sequential.
+            const areaHashes: bigint[] = [];
+            let unknownHashes: bigint[] = [];
+            const typeHistogram = new Map<number, number>();
+            for (const hash of uniqueHashes) {
+                const type = await this.classifyHashType(context, hash);
+                this.log.debug(`[ZONE] hash=${hash} -> type=${type}`);
+                typeHistogram.set(type, (typeHistogram.get(type) ?? 0) + 1);
+                if (type === 0) {
+                    areaHashes.push(hash);
+                }
+                if (type < 0) {
+                    unknownHashes.push(hash);
+                }
+            }
+
+            // MQTT can flap briefly; retry unknown classifications once.
+            if (unknownHashes.length > 0) {
+                this.log.debug(`[ZONE] Retrying ${unknownHashes.length} unknown hash classifications once.`);
+                const retryUnknown: bigint[] = [];
+                for (const hash of unknownHashes) {
+                    await this.sleepMs(200);
+                    const retryType = await this.classifyHashType(context, hash);
+                    this.log.debug(`[ZONE] retry hash=${hash} -> type=${retryType}`);
+                    typeHistogram.set(retryType, (typeHistogram.get(retryType) ?? 0) + 1);
+                    if (retryType === 0 && !areaHashes.some(existing => existing === hash)) {
+                        areaHashes.push(hash);
+                        continue;
+                    }
+                    if (retryType < 0) {
+                        retryUnknown.push(hash);
+                    }
+                }
+                unknownHashes = retryUnknown;
+            }
+
+            const histogramText = [...typeHistogram.entries()]
+                .sort((a, b) => a[0] - b[0])
+                .map(([type, count]) => `${type}:${count}`)
+                .join(', ');
             this.log.info(
-                `[ZONE] ${uniqueHashes.length} mowing-zone hashes received for ${context.deviceName || context.iotId}.`,
+                `[ZONE] ${areaHashes.length} mowing zones (type=0) detected out of ${uniqueHashes.length} hashes (types: ${histogramText})`,
             );
-            this.classifiedAreaHashesByDevice.set(context.key, new Set(uniqueHashes.map(h => h.toString())));
+
+            let finalAreaHashes = areaHashes;
+
+            // If some classifications timed out, keep already known zones instead of dropping them.
+            if (unknownHashes.length > 0 && existingAreas.length > 0) {
+                const merged = new Map<string, bigint>();
+                for (const area of existingAreas) {
+                    merged.set(area.hash.toString(), area.hash);
+                }
+                for (const hash of areaHashes) {
+                    merged.set(hash.toString(), hash);
+                }
+                finalAreaHashes = [...merged.values()];
+                this.log.warn(
+                    `[ZONE] Partial classification (${unknownHashes.length} timeout/unknown). Keeping ${existingAreas.length} existing zones; merged result has ${finalAreaHashes.length} zones.`,
+                );
+            }
+
+            if (!finalAreaHashes.length) {
+                this.log.warn('[ZONE] No mowing zones (type=0) detected - skipping zone update to avoid creating paths/NoGo as zones.');
+                return;
+            }
+
+            this.classifiedAreaHashesByDevice.set(context.key, new Set(finalAreaHashes.map(h => h.toString())));
             const names = this.pendingAreaNamesByDevice.get(context.key);
-            const existingAreas = await this.getKnownAreas(context.key);
             const existingNames = new Map(existingAreas.map(area => [area.hash.toString(), area.name]));
-            const areas = this.buildAreaListWithUniqueNames(uniqueHashes, names, existingNames);
+            const areas = this.buildAreaListWithUniqueNames(finalAreaHashes, names, existingNames);
             await this.updateZoneStates(context.key, areas);
         } finally {
             this.zoneDiscoveryInFlight.delete(context.key);
@@ -4409,6 +4885,43 @@ class Mammotion extends utils.Adapter {
         }
     }
 
+    private async getZoneChannelCount(deviceKey: string): Promise<number> {
+        const zonesRoot = `devices.${deviceKey}.zones`;
+        const zoneChannels = await this.getChannelsOfAsync(zonesRoot);
+        let count = 0;
+        for (const channel of zoneChannels) {
+            const fullId = channel._id || '';
+            const localId = fullId.startsWith(`${this.namespace}.`) ? fullId.slice(this.namespace.length + 1) : fullId;
+            const suffix = localId.startsWith(`${zonesRoot}.`) ? localId.slice(zonesRoot.length + 1) : '';
+            if (!suffix || suffix.includes('.')) {
+                continue;
+            }
+            count += 1;
+        }
+        return count;
+    }
+
+    private async hasZoneStateCoverage(deviceKey: string, expectedZones: number): Promise<boolean> {
+        if (expectedZones <= 0) {
+            return false;
+        }
+        const count = await this.getZoneChannelCount(deviceKey);
+        return count >= expectedZones;
+    }
+
+    private async ensureZoneStatesFromKnownAreas(deviceKey: string): Promise<boolean> {
+        const knownAreas = await this.getKnownAreas(deviceKey);
+        if (!knownAreas.length) {
+            return false;
+        }
+        if (await this.hasZoneStateCoverage(deviceKey, knownAreas.length)) {
+            return true;
+        }
+        this.log.info(`[ZONE] Rebuilding ${knownAreas.length} zone objects from cached areasJson for ${deviceKey}.`);
+        await this.updateZoneStates(deviceKey, knownAreas.map(area => ({ name: area.name, hash: area.hash })));
+        return true;
+    }
+
     /**
      * Sends field-32 (NavGetCommData) for a single hash and waits up to 8 s for the field-33
      * (NavGetCommDataAck) response, which arrives either in the HTTP sync response or via MQTT.
@@ -4431,6 +4944,7 @@ class Mammotion extends utils.Adapter {
                 context,
                 'get-comm-data',
                 (_s, ctx) => this.buildNavGetCommDataContent(_s, ctx, hash),
+                'area',
             ).then(result => {
                 if (result && result !== 'ok' && result.length > 20) {
                     this.resolveCommDataAck(context.key, result);
@@ -4523,24 +5037,21 @@ class Mammotion extends utils.Adapter {
 
     private async requestAreaNamesForAllDevices(): Promise<void> {
         for (const ctx of this.deviceContexts.values()) {
-            if (await this.hasKnownAreas(ctx.key)) {
+            if (!this.isZoneCapableDevice(ctx)) {
+                this.clearAreaNameRetry(ctx.key);
+                continue;
+            }
+            if (await this.ensureZoneStatesFromKnownAreas(ctx.key)) {
                 this.clearAreaNameRetry(ctx.key);
                 continue;
             }
             try {
                 const requestSent = await this.sendAreaNameListRequest(ctx);
-                if (requestSent) {
-                    this.startAreaNameRetry(ctx.key);
-                } else if (!(await this.hasKnownAreas(ctx.key))) {
-                    this.startAreaNameRetry(ctx.key);
+                if (!requestSent) {
+                    this.ensureAreaNameRetryRunning(ctx.key);
                 }
             } catch (err) {
                 this.log.debug(`Area-name request failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
-                if (this.isRateLimitError(err)) {
-                    this.scheduleAreaNameRetryFromCooldown(ctx.key);
-                } else {
-                    this.startAreaNameRetry(ctx.key);
-                }
             }
             await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
         }
@@ -4548,26 +5059,23 @@ class Mammotion extends utils.Adapter {
 
     private async requestAreaNamesForMissingDevices(): Promise<void> {
         for (const ctx of this.deviceContexts.values()) {
-            if (await this.hasKnownAreas(ctx.key)) {
+            if (!this.isZoneCapableDevice(ctx)) {
+                this.clearAreaNameRetry(ctx.key);
+                continue;
+            }
+            if (await this.ensureZoneStatesFromKnownAreas(ctx.key)) {
                 this.clearAreaNameRetry(ctx.key);
                 continue;
             }
             try {
                 const requestSent = await this.sendAreaNameListRequest(ctx);
-                if (requestSent) {
-                    this.startAreaNameRetry(ctx.key);
-                } else if (!(await this.hasKnownAreas(ctx.key))) {
-                    this.startAreaNameRetry(ctx.key);
+                if (!requestSent) {
+                    this.ensureAreaNameRetryRunning(ctx.key);
                 }
             } catch (err) {
                 this.log.debug(
                     `Area-Name-Re-Request (missing) failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`,
                 );
-                if (this.isRateLimitError(err)) {
-                    this.scheduleAreaNameRetryFromCooldown(ctx.key);
-                } else {
-                    this.startAreaNameRetry(ctx.key);
-                }
             }
             await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
         }
@@ -4606,11 +5114,14 @@ class Mammotion extends utils.Adapter {
     }
 
     private isRateLimitError(err: unknown): boolean {
+        if (this.isInvokeRateLimitGateError(err)) {
+            return false;
+        }
         if (axios.isAxiosError(err) && err.response?.status === 429) {
             return true;
         }
         const msg = this.extractAxiosError(err).toLowerCase();
-        return msg.includes('status code 429') || msg.includes('too many requests') || msg.includes('rate limit');
+        return msg.includes('status code 429') || msg.includes('too many requests') || /\b429\b/.test(msg);
     }
 
     private async callAepHandle(session: LegacySession): Promise<AliyunMqttCreds> {
@@ -4726,8 +5237,8 @@ class Mammotion extends utils.Adapter {
                 });
             }
 
-            // Area-name requests are handled by startup/manual retry flow. Avoid reconnect-triggered
-            // request bursts here because unstable MQTT sessions can otherwise amplify API throttling.
+            // Re-check missing zones after MQTT re-connect. The helper is deduplicated and
+            // rate-limited per adapter, so this does not create request storms.
             this.triggerAreaNameMissingRequest('aliyun-connect');
         });
 
@@ -4784,13 +5295,15 @@ class Mammotion extends utils.Adapter {
         }
         try {
             const requestSent = await this.sendAreaNameListRequest(ctx);
-            if (requestSent) {
-                this.startAreaNameRetry(ctx.key);
-            } else if (!(await this.hasKnownAreas(ctx.key))) {
-                this.startAreaNameRetry(ctx.key);
-            }
             await this.setStateChangedAsync(localId, false, true);
-            this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
+            if (requestSent) {
+                this.log.info(`Area-name list requested for ${ctx.deviceName || ctx.iotId}.`);
+            } else {
+                if (this.isZoneCapableDevice(ctx)) {
+                    this.ensureAreaNameRetryRunning(ctx.key);
+                }
+                this.log.info(`Area-name request deferred/skipped for ${ctx.deviceName || ctx.iotId} (cooldown or MQTT not ready).`);
+            }
         } catch (err) {
             const msg = this.extractAxiosError(err);
             await this.setStateChangedAsync(`devices.${deviceKey}.commands.lastError`, msg, true);
@@ -4984,12 +5497,22 @@ class Mammotion extends utils.Adapter {
                     }
                     // hash_len tells us how many of the data_couple entries are actual mowing zones.
                     // The remaining entries are paths/obstacles mixed into the same message.
-                    const zoneHashes = hashLen > 0 && hashes.length > hashLen ? hashes.slice(0, hashLen) : hashes;
+                    const zoneHashes = hashLen > 0 ? hashes.slice(0, Math.min(hashLen, hashes.length)) : hashes;
                     this.log.debug(`[ZONE] ${hashes.length} hashes received (hashLen=${hashLen})`);
                     if (zoneHashes.length === 0) continue;
 
+                    const ackFrame = (total: number, current: number): void => {
+                        const safeTotal = Math.max(1, total);
+                        const safeCurrent = Math.max(1, current);
+                        void this.sendNavGetHashAck(deviceKey, safeTotal, safeCurrent);
+                    };
+
                     // If device sends only one frame, return immediately
-                    if (totalFrame <= 1) return zoneHashes;
+                    if (totalFrame <= 1) {
+                        this.hashListAreaOnlyByDevice.set(deviceKey, hashLen > 0);
+                        ackFrame(totalFrame, currentFrame);
+                        return zoneHashes;
+                    }
 
                     // Multi-frame: accumulate until all frames received
                     let acc = this.hashFrameAccumulator.get(deviceKey);
@@ -4997,10 +5520,13 @@ class Mammotion extends utils.Adapter {
                         acc = { totalFrame, frames: new Map() };
                         this.hashFrameAccumulator.set(deviceKey, acc);
                         this.hashFrameAcked.delete(deviceKey);
+                        this.hashListAreaOnlyByDevice.set(deviceKey, hashLen > 0);
+                    } else if (hashLen > 0) {
+                        this.hashListAreaOnlyByDevice.set(deviceKey, true);
                     }
                     const isNewFrame = !acc.frames.has(currentFrame);
                     acc.frames.set(currentFrame, zoneHashes);
-                    if (isNewFrame && currentFrame < totalFrame) {
+                    if (isNewFrame) {
                         let acked = this.hashFrameAcked.get(deviceKey);
                         if (!acked) {
                             acked = new Set<string>();
@@ -5009,7 +5535,7 @@ class Mammotion extends utils.Adapter {
                         const ackKey = `${totalFrame}:${currentFrame}`;
                         if (!acked.has(ackKey)) {
                             acked.add(ackKey);
-                            void this.sendNavGetHashAck(deviceKey, totalFrame, currentFrame);
+                            ackFrame(totalFrame, currentFrame);
                         }
                     }
                     if (acc.frames.size < totalFrame) return null; // not all frames yet
@@ -5170,17 +5696,11 @@ class Mammotion extends utils.Adapter {
     }
 
     private async hasKnownAreas(deviceKey: string): Promise<boolean> {
-        const areasJsonState = await this.getStateAsync(`devices.${deviceKey}.telemetry.areasJson`);
-        const raw = areasJsonState?.val;
-        if (typeof raw !== 'string' || !raw.trim()) {
+        const knownAreas = await this.getKnownAreas(deviceKey);
+        if (!knownAreas.length) {
             return false;
         }
-        try {
-            const parsed = JSON.parse(raw) as Array<{ hash?: string }>;
-            return Array.isArray(parsed) && parsed.length > 0;
-        } catch {
-            return false;
-        }
+        return this.hasZoneStateCoverage(deviceKey, knownAreas.length);
     }
 
     private clearAreaNameRetry(deviceKey: string): void {
@@ -5190,6 +5710,13 @@ class Mammotion extends utils.Adapter {
             this.areaNameRetryTimers.delete(deviceKey);
         }
         this.areaNameRetryAttempts.delete(deviceKey);
+    }
+
+    private ensureAreaNameRetryRunning(deviceKey: string): void {
+        if (this.areaNameRetryTimers.has(deviceKey)) {
+            return;
+        }
+        this.startAreaNameRetry(deviceKey);
     }
 
     private scheduleAreaNameRetryFromCooldown(deviceKey: string): void {
@@ -5210,7 +5737,7 @@ class Mammotion extends utils.Adapter {
         this.scheduleAreaNameRetryAfter(deviceKey, undefined);
     }
 
-    private scheduleAreaNameRetryAfter(deviceKey: string, delayOverrideMs?: number): void {
+    private scheduleAreaNameRetryAfter(deviceKey: string, delayOverrideMs?: number, consumeAttempt = true): void {
         const attempt = this.areaNameRetryAttempts.get(deviceKey) ?? 0;
         if (attempt >= AREA_NAME_RETRY_DELAYS_MS.length) {
             this.clearAreaNameRetry(deviceKey);
@@ -5221,12 +5748,14 @@ class Mammotion extends utils.Adapter {
             void this.runAreaNameRetry(deviceKey);
         }, delay);
         this.areaNameRetryTimers.set(deviceKey, timer);
-        this.areaNameRetryAttempts.set(deviceKey, attempt + 1);
+        if (consumeAttempt) {
+            this.areaNameRetryAttempts.set(deviceKey, attempt + 1);
+        }
     }
 
     private async runAreaNameRetry(deviceKey: string): Promise<void> {
         this.areaNameRetryTimers.delete(deviceKey);
-        if (await this.hasKnownAreas(deviceKey)) {
+        if (await this.ensureZoneStatesFromKnownAreas(deviceKey)) {
             this.clearAreaNameRetry(deviceKey);
             return;
         }
@@ -5236,12 +5765,21 @@ class Mammotion extends utils.Adapter {
             this.clearAreaNameRetry(deviceKey);
             return;
         }
+        if (!this.isZoneCapableDevice(ctx)) {
+            this.clearAreaNameRetry(deviceKey);
+            return;
+        }
 
         const attempt = this.areaNameRetryAttempts.get(deviceKey) ?? 0;
         this.log.debug(`[AREA-REQ] retry ${attempt}/${AREA_NAME_RETRY_DELAYS_MS.length} for ${ctx.deviceName || ctx.iotId}`);
         try {
             const requestSent = await this.sendAreaNameListRequest(ctx);
             if (!requestSent) {
+                if (this.isDeviceCloudReportedOffline(ctx)) {
+                    this.areaNameAwaitOnline.add(deviceKey);
+                    this.scheduleAreaNameRetryAfter(deviceKey, AREA_NAME_OFFLINE_RETRY_MS, false);
+                    return;
+                }
                 const cooldownUntil = this.areaNameCooldownUntil.get(deviceKey) ?? 0;
                 const cooldownRemainingMs = cooldownUntil - Date.now();
                 if (cooldownRemainingMs > 0) {
@@ -5253,13 +5791,19 @@ class Mammotion extends utils.Adapter {
             }
         } catch (err) {
             this.log.debug(`[AREA-REQ] retry failed for ${ctx.deviceName || ctx.iotId}: ${this.extractAxiosError(err)}`);
+            if (this.isDeviceOfflineError(err)) {
+                this.areaNameAwaitOnline.add(deviceKey);
+                this.markDeviceOnlineState(deviceKey, false, 'area-retry');
+                this.scheduleAreaNameRetryAfter(deviceKey, AREA_NAME_OFFLINE_RETRY_MS, false);
+                return;
+            }
             if (this.isRateLimitError(err)) {
                 this.scheduleAreaNameRetryFromCooldown(deviceKey);
                 return;
             }
         }
 
-        if (await this.hasKnownAreas(deviceKey)) {
+        if (await this.ensureZoneStatesFromKnownAreas(deviceKey)) {
             this.clearAreaNameRetry(deviceKey);
             return;
         }
