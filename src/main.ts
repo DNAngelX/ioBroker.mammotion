@@ -159,6 +159,8 @@ const AREA_NAME_MAP_NAME_SETTLE_ASYNC_MS = 12_000;
 const AREA_NAME_SIGNAL_POLL_MS = 200;
 const AREA_NAME_OFFLINE_RETRY_MS = 60_000;
 const AREA_NAME_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
+const AREA_NAME_BACKGROUND_REFRESH_MS = 30 * 60 * 1000;
+const AREA_NAME_REFRESH_AFTER_RESTART_MIN_MS = 60 * 1000;
 const MQTT_STALE_EVENT_THRESHOLD_MS = 60_000;
 type InvokeRateLimitScope = 'command' | 'area' | 'sync' | 'internal';
 
@@ -2187,47 +2189,63 @@ class Mammotion extends utils.Adapter {
         scope: InvokeRateLimitScope = 'command',
     ): Promise<string> {
         return this.runSerializedDeviceInvoke(context, scope, 'invoke-fallback', async () => {
-            if (isAliyunProductKey(context.productKey)) {
-                this.log.debug(
-                    `[INVOKE] ${context.deviceName || context.iotId} uses Aliyun productKey ${context.productKey}; using Aliyun invoke.`,
-                );
-                return this.invokeTaskControlCommandLegacy(session, context, content, scope);
-            }
+            const isAliyun = isAliyunProductKey(context.productKey);
+
+            // For non-area commands on known legacy-only devices, skip modern path.
             if (scope !== 'area' && this.legacyOnlyCommandDevices.has(context.key)) {
                 return this.invokeTaskControlCommandLegacy(session, context, content, scope);
             }
-            try {
-                return await this.invokeTaskControlCommandModern(session, context, content);
-            } catch (err) {
-                const msg = this.extractAxiosError(err).toLowerCase();
-                this.log.debug(`[MODERN-INVOKE] failed for ${context.deviceName || context.iotId}: ${msg}`);
-                // Fall through to legacy for "Invalid device" (Luba1/legacy devices) and
-                // "Access to this resource requires authentication" (shared-account devices).
-                // Legacy uses iotToken which is independent of the modern Bearer JWT.
-                const unsupportedModernPath =
-                    msg.includes('invalid device') || msg.includes('access to this resource');
-                const areaOfflineOnModernPath = scope === 'area' && (
-                    msg.includes('device is offline') ||
-                    msg.includes('the device is offline') ||
-                    msg.includes('code=6205') ||
-                    msg.includes('code:6205') ||
-                    msg.includes('50104')
-                );
-                if (areaOfflineOnModernPath) {
-                    // Align with PyMammotion: for area requests, offline codes on
-                    // the modern invoke path are treated as offline and must not
-                    // be forced through legacy invoke.
-                    throw err;
-                }
-                if (!unsupportedModernPath) {
-                    throw err;
-                }
-                if (unsupportedModernPath && scope !== 'area') {
-                    this.legacyOnlyCommandDevices.add(context.key);
+
+            // Try the modern JWT path first even for Aliyun devices.
+            // The Aliyun /thing/service/invoke HTTP gateway is subject to strict
+            // account-level rate limits (429), whereas the modern Mammotion backend
+            // path (/v1/mqtt/rpc/…) uses a different quota.
+            // If the modern path is unavailable for this device (e.g. "invalid device"),
+            // we fall back to Aliyun legacy.  For area requests we always try modern
+            // first and only fall back if it fails with a non-rate-limit error.
+            if (session.accessToken) {
+                try {
+                    const result = await this.invokeTaskControlCommandModern(session, context, content);
+                    if (isAliyun) {
+                        this.log.debug(
+                            `[INVOKE] ${context.deviceName || context.iotId} Aliyun device responded on modern path.`,
+                        );
+                    }
+                    return result;
+                } catch (err) {
+                    const msg = this.extractAxiosError(err).toLowerCase();
+                    this.log.debug(`[MODERN-INVOKE] failed for ${context.deviceName || context.iotId}: ${msg}`);
+                    // Fall through to legacy for "Invalid device" (Luba1/legacy devices) and
+                    // "Access to this resource requires authentication" (shared-account devices).
+                    // Legacy uses iotToken which is independent of the modern Bearer JWT.
+                    const unsupportedModernPath =
+                        msg.includes('invalid device') || msg.includes('access to this resource');
+                    const areaOfflineOnModernPath = scope === 'area' && (
+                        msg.includes('device is offline') ||
+                        msg.includes('the device is offline') ||
+                        msg.includes('code=6205') ||
+                        msg.includes('code:6205') ||
+                        msg.includes('50104')
+                    );
+                    if (areaOfflineOnModernPath) {
+                        throw err;
+                    }
+                    if (!unsupportedModernPath) {
+                        throw err;
+                    }
+                    if (unsupportedModernPath && scope !== 'area') {
+                        this.legacyOnlyCommandDevices.add(context.key);
+                    }
                 }
             }
 
-            this.log.warn(`Modern command path not supported for ${context.deviceName || context.iotId}, using Aliyun fallback.`);
+            if (isAliyun) {
+                this.log.debug(
+                    `[INVOKE] ${context.deviceName || context.iotId} uses Aliyun productKey ${context.productKey}; using Aliyun legacy invoke.`,
+                );
+            } else {
+                this.log.warn(`Modern command path not supported for ${context.deviceName || context.iotId}, using Aliyun fallback.`);
+            }
             return this.invokeTaskControlCommandLegacy(session, context, content, scope);
         });
     }
@@ -2533,6 +2551,9 @@ class Mammotion extends utils.Adapter {
         const invoke = async (forceSessionRefresh: boolean): Promise<LegacyInvokeData | null> => {
             checkInvokeRateLimitGate();
             const legacy = await this.ensureLegacySession(session, forceSessionRefresh);
+            this.log.debug(
+                `[LEGACY-INVOKE-DBG] endpoint=${legacy.apiGatewayEndpoint} iotId=${context.iotId} tokenLen=${legacy.iotToken?.length ?? 0} tokenPrefix=${legacy.iotToken?.substring(0, 12) ?? 'none'}`,
+            );
             const response = await this.callLegacyApi<LegacyInvokeData>(
                 legacy.apiGatewayEndpoint,
                 '/thing/service/invoke',
@@ -3786,6 +3807,11 @@ class Mammotion extends utils.Adapter {
         const headers = this.buildLegacyGatewayHeaders(domain, bodyText);
         this.signLegacyGatewayRequest('POST', path, headers, { 'x-ca-request-id': requestId });
         headers.ca_version = '1';
+        if (path === '/thing/service/invoke') {
+            this.log.debug(
+                `[LEGACY-REQ-DBG] url=https://${domain}${path}?x-ca-request-id=${requestId} body=${bodyText.substring(0, 500)} headers_keys=${Object.keys(headers).join(',')} timestamp=${headers['x-ca-timestamp']} md5=${headers['content-md5']}`,
+            );
+        }
         try {
             const response = await axios.post<LegacyApiResponse<TData>>(`https://${domain}${path}`, bodyText, {
                 headers,
@@ -3799,8 +3825,9 @@ class Mammotion extends utils.Adapter {
                 if (status >= 400) {
                     const raw = err.response?.data;
                     const body = typeof raw === 'string' ? raw : raw ? JSON.stringify(raw) : '';
+                    const hdrs = JSON.stringify(err.response?.headers ?? {});
                     this.log.debug(
-                        `[LEGACY-API] ${path} failed (status=${status})${body ? ` body=${body.substring(0, 500)}` : ''}`,
+                        `[LEGACY-API] ${path} failed (status=${status})${body ? ` body=${body.substring(0, 500)}` : ' (no body)'} headers=${hdrs.substring(0, 400)}`,
                     );
                 }
             }
@@ -3983,7 +4010,10 @@ class Mammotion extends utils.Adapter {
     }
 
     private legacyTimestampNs(): string {
-        return `${BigInt(Date.now()) * 1_000_000n}`;
+        // Aliyun API gateway expects the timestamp in MILLISECONDS.
+        // Previous nanoseconds (Date.now() * 1_000_000) caused immediate 429 rejections
+        // because the timestamp appeared billions of years in the future.
+        return `${Date.now()}`;
     }
 
     private randomUuid(): string {
@@ -4752,8 +4782,7 @@ class Mammotion extends utils.Adapter {
                     Math.trunc(err.retryAfterMs ?? this.getInvokeRateLimitRemainingMs(context, 'area')),
                 );
                 const cooldownUntilTs = Date.now() + retryAfterMs;
-                this.areaNameCooldownUntil.set(context.key, cooldownUntilTs);
-                await this.persistAreaNameCooldownUntil(context.key, cooldownUntilTs);
+                await this.applyAreaCooldownToZoneDevices(cooldownUntilTs);
                 this.log.debug(
                     `[AREA-REQ] Internal invoke gate active for ${context.deviceName || context.iotId}, deferring for ${Math.ceil(
                         retryAfterMs / 1000,
@@ -4766,11 +4795,16 @@ class Mammotion extends utils.Adapter {
                 this.areaNameRateLimitHits.set(context.key, hits);
                 const backoffMultiplier = Math.min(2 ** (hits - 1), 30);
                 const areaCooldownMs = Math.min(AREA_NAME_RATE_LIMIT_COOLDOWN_MS * backoffMultiplier, AREA_NAME_RATE_LIMIT_COOLDOWN_MAX_MS);
-                const invokeCooldownMs = this.armInvokeRateLimit(context, 'area');
+                const invokeCooldownMs = (() => {
+                    const remaining = this.getInvokeRateLimitRemainingMs(context, 'area');
+                    if (remaining > 0) {
+                        return remaining;
+                    }
+                    return this.armInvokeRateLimit(context, 'area');
+                })();
                 const cooldownMs = Math.max(areaCooldownMs, invokeCooldownMs);
                 const cooldownUntilTs = Date.now() + cooldownMs;
-                this.areaNameCooldownUntil.set(context.key, cooldownUntilTs);
-                await this.persistAreaNameCooldownUntil(context.key, cooldownUntilTs);
+                await this.applyAreaCooldownToZoneDevices(cooldownUntilTs);
                 const axiosErr = err as AxiosError;
                 const rateBodyRaw = axiosErr?.response?.data;
                 const rateBody =
@@ -4851,16 +4885,19 @@ class Mammotion extends utils.Adapter {
             this.lastRequestedHashSetByDevice.set(context.key, hashSetKey);
 
             const areaOnlyFromHashList = this.hashListAreaOnlyByDevice.get(context.key) ?? false;
-            const preferHashListAsAreas = areaOnlyFromHashList || context.owned === 0 || this.legacyOnlyCommandDevices.has(context.key);
+            // When hash_len was present in NavGetHashListAck the sliced list is already area-only.
+            // Skip per-hash classifyHashType invoke calls (each one is a /thing/service/invoke
+            // HTTP call that causes 429 storms when there are many hashes).
+            const preferHashListAsAreas = areaOnlyFromHashList;
 
             // PyMammotion now treats the root hash list as the source of truth.
             // If hash_len was present in NavGetHashListAck, the parsed list is already area-only.
             // Avoid per-hash cloud invokes here to prevent 429 storms during discovery.
-            // Shared devices (owned=0) often reject/limit per-hash classify invokes aggressively,
-            // so we use hash-list directly there as a best-effort zone source.
+            // Only trust hash-list directly when hash_len was provided in NavGetHashListAck.
+            // Otherwise we still classify by type to avoid mixing in paths/no-go/obstacles as zones.
             if (preferHashListAsAreas) {
                 this.log.info(
-                    `[ZONE] ${uniqueHashes.length} zones detected from hash list (${areaOnlyFromHashList ? 'hash_len' : 'shared/legacy fallback'}). Applying without per-hash classify.`,
+                    `[ZONE] ${uniqueHashes.length} zones detected from hash list (hash_len). Applying without per-hash classify.`,
                 );
                 this.classifiedAreaHashesByDevice.set(context.key, new Set(uniqueHashes.map(h => h.toString())));
                 const names = this.pendingAreaNamesByDevice.get(context.key);
@@ -4868,6 +4905,11 @@ class Mammotion extends utils.Adapter {
                 const areas = this.buildAreaListWithUniqueNames(uniqueHashes, names, existingNames);
                 await this.updateZoneStates(context.key, areas);
                 return;
+            }
+            if (areaOnlyFromHashList) {
+                this.log.debug(
+                    `[ZONE] hash_len present for ${context.deviceName || context.iotId}, but forcing type-based filtering to avoid non-area hashes.`,
+                );
             }
 
             // Classify each hash one at a time. The mower tends to ignore/timeout overlapping
@@ -5053,6 +5095,12 @@ class Mammotion extends utils.Adapter {
         if (!knownAreas.length) {
             return false;
         }
+        // Populate classifiedAreaHashesByDevice so shouldRequestAreaRefresh does not
+        // treat a fresh-restart adapter (empty in-memory map) as "unclassified" and
+        // immediately fire a redundant invoke when areasJson already has valid data.
+        if (!this.classifiedAreaHashesByDevice.has(deviceKey)) {
+            this.classifiedAreaHashesByDevice.set(deviceKey, new Set(knownAreas.map(a => a.hash.toString())));
+        }
         if (await this.hasZoneStateCoverage(deviceKey, knownAreas.length)) {
             return true;
         }
@@ -5202,7 +5250,8 @@ class Mammotion extends utils.Adapter {
                 this.clearAreaNameRetry(ctx.key);
                 continue;
             }
-            if (await this.ensureZoneStatesFromKnownAreas(ctx.key)) {
+            await this.ensureZoneStatesFromKnownAreas(ctx.key);
+            if (!(await this.shouldRequestAreaRefresh(ctx.key))) {
                 this.clearAreaNameRetry(ctx.key);
                 continue;
             }
@@ -5218,6 +5267,30 @@ class Mammotion extends utils.Adapter {
             }
             await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
         }
+    }
+
+    private async shouldRequestAreaRefresh(deviceKey: string): Promise<boolean> {
+        if (!(await this.hasKnownAreas(deviceKey))) {
+            return true;
+        }
+
+        const lastRequestState = await this.getStateAsync(`devices.${deviceKey}.telemetry.lastAreaRequestTs`);
+        const lastRequestTs = Number(lastRequestState?.val);
+        if (!Number.isFinite(lastRequestTs) || lastRequestTs <= 0) {
+            return true;
+        }
+
+        const ageMs = Date.now() - lastRequestTs;
+        if (ageMs >= AREA_NAME_BACKGROUND_REFRESH_MS) {
+            return true;
+        }
+
+        const hasClassifiedHashes = (this.classifiedAreaHashesByDevice.get(deviceKey)?.size ?? 0) > 0;
+        if (!hasClassifiedHashes && ageMs >= AREA_NAME_REFRESH_AFTER_RESTART_MIN_MS) {
+            return true;
+        }
+
+        return false;
     }
 
     private triggerAreaNameMissingRequest(reason: string): void {
@@ -5275,6 +5348,18 @@ class Mammotion extends utils.Adapter {
     private async persistAreaNameCooldownUntil(deviceKey: string, untilTs: number): Promise<void> {
         this.areaNameCooldownStateHydrated.add(deviceKey);
         await this.setStateChangedAsync(this.getAreaRateLimitUntilStateId(deviceKey), Math.max(0, Math.trunc(untilTs)), true);
+    }
+
+    private async applyAreaCooldownToZoneDevices(untilTs: number): Promise<void> {
+        const tasks: Promise<void>[] = [];
+        for (const ctx of this.deviceContexts.values()) {
+            if (!this.isZoneCapableDevice(ctx)) {
+                continue;
+            }
+            this.areaNameCooldownUntil.set(ctx.key, untilTs);
+            tasks.push(this.persistAreaNameCooldownUntil(ctx.key, untilTs));
+        }
+        await Promise.all(tasks);
     }
 
     private async clearAreaNameRateLimitState(context: DeviceContext): Promise<void> {
@@ -5717,9 +5802,10 @@ class Mammotion extends utils.Adapter {
                             hashes.push(entry as bigint);
                         }
                     }
-                    // hash_len tells us how many of the data_couple entries are actual mowing zones.
-                    // The remaining entries are paths/obstacles mixed into the same message.
-                    const zoneHashes = hashLen > 0 ? hashes.slice(0, Math.min(hashLen, hashes.length)) : hashes;
+                    // hash_len tells us how many of the full (cross-frame) data_couple entries
+                    // are actual mowing zones. We must not slice per frame when multiple frames
+                    // are involved, otherwise non-area hashes can leak into the result.
+                    const zoneHashes = hashes;
                     this.log.debug(`[ZONE] ${hashes.length} hashes received (hashLen=${hashLen})`);
                     if (zoneHashes.length === 0) continue;
 
@@ -5731,9 +5817,10 @@ class Mammotion extends utils.Adapter {
 
                     // If device sends only one frame, return immediately
                     if (totalFrame <= 1) {
+                        const singleFrameHashes = hashLen > 0 ? zoneHashes.slice(0, Math.min(hashLen, zoneHashes.length)) : zoneHashes;
                         this.hashListAreaOnlyByDevice.set(deviceKey, hashLen > 0);
                         ackFrame(totalFrame, currentFrame);
-                        return zoneHashes;
+                        return singleFrameHashes;
                     }
 
                     // Multi-frame: accumulate until all frames received
@@ -5769,7 +5856,8 @@ class Mammotion extends utils.Adapter {
                     this.hashFrameAccumulator.delete(deviceKey);
                     this.hashFrameAcked.delete(deviceKey);
                     this.log.debug(`[PROTO] NavGetHashListAck all ${totalFrame} frames received, ${allHashes.length} total hashes`);
-                    return allHashes;
+                    const finalHashes = hashLen > 0 ? allHashes.slice(0, Math.min(hashLen, allHashes.length)) : allHashes;
+                    return finalHashes;
                 }
             }
             return null;
@@ -5853,8 +5941,19 @@ class Mammotion extends utils.Adapter {
             return;
         }
 
-        // Do not create new zones from direct name lists before we know which hashes are real mowing areas.
-        // If we already have known areas, only rename those matching hashes.
+        // toapp_all_hash_name (field 61) contains ONLY mowing area hashes – trust it directly
+        // as the definitive area list, the same way PyMammotion's StateReducer does.
+        // This avoids the per-hash classifyHashType invoke loop that causes 429 storms.
+        const namedAreas = areas.filter(a => a.name.length > 0);
+        if (namedAreas.length > 0) {
+            this.classifiedAreaHashesByDevice.set(deviceKey, new Set(namedAreas.map(a => a.hash.toString())));
+            void this.updateZoneStates(deviceKey, namedAreas).catch(err => {
+                this.log.debug(`[ZONE] failed to apply toapp_all_hash_name areas for ${deviceKey}: ${this.extractAxiosError(err)}`);
+            });
+            return;
+        }
+
+        // Fallback: if we already have known areas, only rename those matching hashes.
         void (async () => {
             const knownAreas = await this.getKnownAreas(deviceKey);
             if (!knownAreas.length) {

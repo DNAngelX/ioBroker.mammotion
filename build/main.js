@@ -169,6 +169,8 @@ const AREA_NAME_MAP_NAME_SETTLE_ASYNC_MS = 12e3;
 const AREA_NAME_SIGNAL_POLL_MS = 200;
 const AREA_NAME_OFFLINE_RETRY_MS = 6e4;
 const AREA_NAME_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1e3;
+const AREA_NAME_BACKGROUND_REFRESH_MS = 30 * 60 * 1e3;
+const AREA_NAME_REFRESH_AFTER_RESTART_MIN_MS = 60 * 1e3;
 const MQTT_STALE_EVENT_THRESHOLD_MS = 6e4;
 class Mammotion extends utils.Adapter {
   mqttClient = null;
@@ -1923,33 +1925,42 @@ class Mammotion extends utils.Adapter {
   }
   async invokeTaskControlCommandWithFallback(session, context, content, scope = "command") {
     return this.runSerializedDeviceInvoke(context, scope, "invoke-fallback", async () => {
-      if ((0, import_product_keys.isAliyunProductKey)(context.productKey)) {
-        this.log.debug(
-          `[INVOKE] ${context.deviceName || context.iotId} uses Aliyun productKey ${context.productKey}; using Aliyun invoke.`
-        );
-        return this.invokeTaskControlCommandLegacy(session, context, content, scope);
-      }
+      const isAliyun = (0, import_product_keys.isAliyunProductKey)(context.productKey);
       if (scope !== "area" && this.legacyOnlyCommandDevices.has(context.key)) {
         return this.invokeTaskControlCommandLegacy(session, context, content, scope);
       }
-      try {
-        return await this.invokeTaskControlCommandModern(session, context, content);
-      } catch (err) {
-        const msg = this.extractAxiosError(err).toLowerCase();
-        this.log.debug(`[MODERN-INVOKE] failed for ${context.deviceName || context.iotId}: ${msg}`);
-        const unsupportedModernPath = msg.includes("invalid device") || msg.includes("access to this resource");
-        const areaOfflineOnModernPath = scope === "area" && (msg.includes("device is offline") || msg.includes("the device is offline") || msg.includes("code=6205") || msg.includes("code:6205") || msg.includes("50104"));
-        if (areaOfflineOnModernPath) {
-          throw err;
-        }
-        if (!unsupportedModernPath) {
-          throw err;
-        }
-        if (unsupportedModernPath && scope !== "area") {
-          this.legacyOnlyCommandDevices.add(context.key);
+      if (session.accessToken) {
+        try {
+          const result = await this.invokeTaskControlCommandModern(session, context, content);
+          if (isAliyun) {
+            this.log.debug(
+              `[INVOKE] ${context.deviceName || context.iotId} Aliyun device responded on modern path.`
+            );
+          }
+          return result;
+        } catch (err) {
+          const msg = this.extractAxiosError(err).toLowerCase();
+          this.log.debug(`[MODERN-INVOKE] failed for ${context.deviceName || context.iotId}: ${msg}`);
+          const unsupportedModernPath = msg.includes("invalid device") || msg.includes("access to this resource");
+          const areaOfflineOnModernPath = scope === "area" && (msg.includes("device is offline") || msg.includes("the device is offline") || msg.includes("code=6205") || msg.includes("code:6205") || msg.includes("50104"));
+          if (areaOfflineOnModernPath) {
+            throw err;
+          }
+          if (!unsupportedModernPath) {
+            throw err;
+          }
+          if (unsupportedModernPath && scope !== "area") {
+            this.legacyOnlyCommandDevices.add(context.key);
+          }
         }
       }
-      this.log.warn(`Modern command path not supported for ${context.deviceName || context.iotId}, using Aliyun fallback.`);
+      if (isAliyun) {
+        this.log.debug(
+          `[INVOKE] ${context.deviceName || context.iotId} uses Aliyun productKey ${context.productKey}; using Aliyun legacy invoke.`
+        );
+      } else {
+        this.log.warn(`Modern command path not supported for ${context.deviceName || context.iotId}, using Aliyun fallback.`);
+      }
       return this.invokeTaskControlCommandLegacy(session, context, content, scope);
     });
   }
@@ -2180,8 +2191,12 @@ class Mammotion extends utils.Adapter {
       }
     };
     const invoke = async (forceSessionRefresh) => {
+      var _a2, _b2, _c2, _d2;
       checkInvokeRateLimitGate();
       const legacy = await this.ensureLegacySession(session, forceSessionRefresh);
+      this.log.debug(
+        `[LEGACY-INVOKE-DBG] endpoint=${legacy.apiGatewayEndpoint} iotId=${context.iotId} tokenLen=${(_b2 = (_a2 = legacy.iotToken) == null ? void 0 : _a2.length) != null ? _b2 : 0} tokenPrefix=${(_d2 = (_c2 = legacy.iotToken) == null ? void 0 : _c2.substring(0, 12)) != null ? _d2 : "none"}`
+      );
       const response = await this.callLegacyApi(
         legacy.apiGatewayEndpoint,
         "/thing/service/invoke",
@@ -3249,7 +3264,7 @@ class Mammotion extends utils.Adapter {
     return { lat, lon };
   }
   async callLegacyApi(domain, path, apiVer, params, iotToken) {
-    var _a, _b, _c;
+    var _a, _b, _c, _d, _e;
     const body = {
       id: this.randomUuid(),
       params,
@@ -3265,6 +3280,11 @@ class Mammotion extends utils.Adapter {
     const headers = this.buildLegacyGatewayHeaders(domain, bodyText);
     this.signLegacyGatewayRequest("POST", path, headers, { "x-ca-request-id": requestId });
     headers.ca_version = "1";
+    if (path === "/thing/service/invoke") {
+      this.log.debug(
+        `[LEGACY-REQ-DBG] url=https://${domain}${path}?x-ca-request-id=${requestId} body=${bodyText.substring(0, 500)} headers_keys=${Object.keys(headers).join(",")} timestamp=${headers["x-ca-timestamp"]} md5=${headers["content-md5"]}`
+      );
+    }
     try {
       const response = await import_axios.default.post(`https://${domain}${path}`, bodyText, {
         headers,
@@ -3278,8 +3298,9 @@ class Mammotion extends utils.Adapter {
         if (status >= 400) {
           const raw = (_c = err.response) == null ? void 0 : _c.data;
           const body2 = typeof raw === "string" ? raw : raw ? JSON.stringify(raw) : "";
+          const hdrs = JSON.stringify((_e = (_d = err.response) == null ? void 0 : _d.headers) != null ? _e : {});
           this.log.debug(
-            `[LEGACY-API] ${path} failed (status=${status})${body2 ? ` body=${body2.substring(0, 500)}` : ""}`
+            `[LEGACY-API] ${path} failed (status=${status})${body2 ? ` body=${body2.substring(0, 500)}` : " (no body)"} headers=${hdrs.substring(0, 400)}`
           );
         }
       }
@@ -3450,7 +3471,7 @@ ${url}`;
     return (/* @__PURE__ */ new Date()).toUTCString();
   }
   legacyTimestampNs() {
-    return `${BigInt(Date.now()) * 1000000n}`;
+    return `${Date.now()}`;
   }
   randomUuid() {
     const nativeCrypto = globalThis.crypto;
@@ -4129,8 +4150,7 @@ ${url}`;
           Math.trunc((_l = err.retryAfterMs) != null ? _l : this.getInvokeRateLimitRemainingMs(context, "area"))
         );
         const cooldownUntilTs = Date.now() + retryAfterMs;
-        this.areaNameCooldownUntil.set(context.key, cooldownUntilTs);
-        await this.persistAreaNameCooldownUntil(context.key, cooldownUntilTs);
+        await this.applyAreaCooldownToZoneDevices(cooldownUntilTs);
         this.log.debug(
           `[AREA-REQ] Internal invoke gate active for ${context.deviceName || context.iotId}, deferring for ${Math.ceil(
             retryAfterMs / 1e3
@@ -4143,11 +4163,16 @@ ${url}`;
         this.areaNameRateLimitHits.set(context.key, hits);
         const backoffMultiplier = Math.min(2 ** (hits - 1), 30);
         const areaCooldownMs = Math.min(AREA_NAME_RATE_LIMIT_COOLDOWN_MS * backoffMultiplier, AREA_NAME_RATE_LIMIT_COOLDOWN_MAX_MS);
-        const invokeCooldownMs = this.armInvokeRateLimit(context, "area");
+        const invokeCooldownMs = (() => {
+          const remaining = this.getInvokeRateLimitRemainingMs(context, "area");
+          if (remaining > 0) {
+            return remaining;
+          }
+          return this.armInvokeRateLimit(context, "area");
+        })();
         const cooldownMs = Math.max(areaCooldownMs, invokeCooldownMs);
         const cooldownUntilTs = Date.now() + cooldownMs;
-        this.areaNameCooldownUntil.set(context.key, cooldownUntilTs);
-        await this.persistAreaNameCooldownUntil(context.key, cooldownUntilTs);
+        await this.applyAreaCooldownToZoneDevices(cooldownUntilTs);
         const axiosErr = err;
         const rateBodyRaw = (_n = axiosErr == null ? void 0 : axiosErr.response) == null ? void 0 : _n.data;
         const rateBody = typeof rateBodyRaw === "string" ? rateBodyRaw : rateBodyRaw ? JSON.stringify(rateBodyRaw) : "";
@@ -4214,10 +4239,10 @@ ${url}`;
       }
       this.lastRequestedHashSetByDevice.set(context.key, hashSetKey);
       const areaOnlyFromHashList = (_a = this.hashListAreaOnlyByDevice.get(context.key)) != null ? _a : false;
-      const preferHashListAsAreas = areaOnlyFromHashList || context.owned === 0 || this.legacyOnlyCommandDevices.has(context.key);
+      const preferHashListAsAreas = areaOnlyFromHashList;
       if (preferHashListAsAreas) {
         this.log.info(
-          `[ZONE] ${uniqueHashes.length} zones detected from hash list (${areaOnlyFromHashList ? "hash_len" : "shared/legacy fallback"}). Applying without per-hash classify.`
+          `[ZONE] ${uniqueHashes.length} zones detected from hash list (hash_len). Applying without per-hash classify.`
         );
         this.classifiedAreaHashesByDevice.set(context.key, new Set(uniqueHashes.map((h) => h.toString())));
         const names2 = this.pendingAreaNamesByDevice.get(context.key);
@@ -4225,6 +4250,11 @@ ${url}`;
         const areas2 = this.buildAreaListWithUniqueNames(uniqueHashes, names2, existingNames2);
         await this.updateZoneStates(context.key, areas2);
         return;
+      }
+      if (areaOnlyFromHashList) {
+        this.log.debug(
+          `[ZONE] hash_len present for ${context.deviceName || context.iotId}, but forcing type-based filtering to avoid non-area hashes.`
+        );
       }
       const areaHashes = [];
       let unknownHashes = [];
@@ -4378,6 +4408,9 @@ ${url}`;
     if (!knownAreas.length) {
       return false;
     }
+    if (!this.classifiedAreaHashesByDevice.has(deviceKey)) {
+      this.classifiedAreaHashesByDevice.set(deviceKey, new Set(knownAreas.map((a) => a.hash.toString())));
+    }
     if (await this.hasZoneStateCoverage(deviceKey, knownAreas.length)) {
       return true;
     }
@@ -4513,7 +4546,8 @@ ${url}`;
         this.clearAreaNameRetry(ctx.key);
         continue;
       }
-      if (await this.ensureZoneStatesFromKnownAreas(ctx.key)) {
+      await this.ensureZoneStatesFromKnownAreas(ctx.key);
+      if (!await this.shouldRequestAreaRefresh(ctx.key)) {
         this.clearAreaNameRetry(ctx.key);
         continue;
       }
@@ -4529,6 +4563,26 @@ ${url}`;
       }
       await this.sleepMs(AREA_NAME_REQUEST_STEP_DELAY_MS);
     }
+  }
+  async shouldRequestAreaRefresh(deviceKey) {
+    var _a, _b;
+    if (!await this.hasKnownAreas(deviceKey)) {
+      return true;
+    }
+    const lastRequestState = await this.getStateAsync(`devices.${deviceKey}.telemetry.lastAreaRequestTs`);
+    const lastRequestTs = Number(lastRequestState == null ? void 0 : lastRequestState.val);
+    if (!Number.isFinite(lastRequestTs) || lastRequestTs <= 0) {
+      return true;
+    }
+    const ageMs = Date.now() - lastRequestTs;
+    if (ageMs >= AREA_NAME_BACKGROUND_REFRESH_MS) {
+      return true;
+    }
+    const hasClassifiedHashes = ((_b = (_a = this.classifiedAreaHashesByDevice.get(deviceKey)) == null ? void 0 : _a.size) != null ? _b : 0) > 0;
+    if (!hasClassifiedHashes && ageMs >= AREA_NAME_REFRESH_AFTER_RESTART_MIN_MS) {
+      return true;
+    }
+    return false;
   }
   triggerAreaNameMissingRequest(reason) {
     if (this.areaNameMissingRequestInFlight) {
@@ -4577,6 +4631,17 @@ ${url}`;
   async persistAreaNameCooldownUntil(deviceKey, untilTs) {
     this.areaNameCooldownStateHydrated.add(deviceKey);
     await this.setStateChangedAsync(this.getAreaRateLimitUntilStateId(deviceKey), Math.max(0, Math.trunc(untilTs)), true);
+  }
+  async applyAreaCooldownToZoneDevices(untilTs) {
+    const tasks = [];
+    for (const ctx of this.deviceContexts.values()) {
+      if (!this.isZoneCapableDevice(ctx)) {
+        continue;
+      }
+      this.areaNameCooldownUntil.set(ctx.key, untilTs);
+      tasks.push(this.persistAreaNameCooldownUntil(ctx.key, untilTs));
+    }
+    await Promise.all(tasks);
   }
   async clearAreaNameRateLimitState(context) {
     this.areaNameRateLimitHits.delete(context.key);
@@ -4960,7 +5025,7 @@ ${url}`;
               hashes.push(entry);
             }
           }
-          const zoneHashes = hashLen > 0 ? hashes.slice(0, Math.min(hashLen, hashes.length)) : hashes;
+          const zoneHashes = hashes;
           this.log.debug(`[ZONE] ${hashes.length} hashes received (hashLen=${hashLen})`);
           if (zoneHashes.length === 0) continue;
           const ackFrame = (total, current) => {
@@ -4969,9 +5034,10 @@ ${url}`;
             void this.sendNavGetHashAck(deviceKey, safeTotal, safeCurrent);
           };
           if (totalFrame <= 1) {
+            const singleFrameHashes = hashLen > 0 ? zoneHashes.slice(0, Math.min(hashLen, zoneHashes.length)) : zoneHashes;
             this.hashListAreaOnlyByDevice.set(deviceKey, hashLen > 0);
             ackFrame(totalFrame, currentFrame);
-            return zoneHashes;
+            return singleFrameHashes;
           }
           let acc = this.hashFrameAccumulator.get(deviceKey);
           if (!acc || acc.totalFrame !== totalFrame) {
@@ -5004,7 +5070,8 @@ ${url}`;
           this.hashFrameAccumulator.delete(deviceKey);
           this.hashFrameAcked.delete(deviceKey);
           this.log.debug(`[PROTO] NavGetHashListAck all ${totalFrame} frames received, ${allHashes.length} total hashes`);
-          return allHashes;
+          const finalHashes = hashLen > 0 ? allHashes.slice(0, Math.min(hashLen, allHashes.length)) : allHashes;
+          return finalHashes;
         }
       }
       return null;
@@ -5074,6 +5141,14 @@ ${url}`;
       }
       void this.updateZoneStates(deviceKey, filtered).catch((err) => {
         this.log.debug(`[ZONE] failed to apply direct area names for ${deviceKey}: ${this.extractAxiosError(err)}`);
+      });
+      return;
+    }
+    const namedAreas = areas.filter((a) => a.name.length > 0);
+    if (namedAreas.length > 0) {
+      this.classifiedAreaHashesByDevice.set(deviceKey, new Set(namedAreas.map((a) => a.hash.toString())));
+      void this.updateZoneStates(deviceKey, namedAreas).catch((err) => {
+        this.log.debug(`[ZONE] failed to apply toapp_all_hash_name areas for ${deviceKey}: ${this.extractAxiosError(err)}`);
       });
       return;
     }
