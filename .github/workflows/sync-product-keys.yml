@@ -25,7 +25,7 @@ jobs:
         run: npm run sync:product-keys
 
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@v8
         with:
           commit-message: "chore: sync product keys from PyMammotion"
           title: "chore: sync product keys from PyMammotion"
